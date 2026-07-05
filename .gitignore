@@ -24,3 +24,5 @@ state/
 
 # Build artifacts
 opt-lab/bench_results.json
+data/call_grid_cache.json
+data/station_catalog.json
