@@ -41,6 +41,7 @@ rsync "${RSYNC_EX[@]}" \
   "$SRC/scripts/" "$DST/scripts/"
 rsync "${RSYNC_EX[@]}" "$SRC/data/" "$DST/data/"
 rsync "${RSYNC_EX[@]}" "$SRC/opt-lab/" "$DST/opt-lab/"
+rsync "${RSYNC_EX[@]}" "$SRC/firmware/" "$DST/firmware/"
 
 # Keep publish-only scripts
 cp -a "$DST/scripts/publish_to_github.sh" "$DST/scripts/publish_to_github.sh" 2>/dev/null || true
