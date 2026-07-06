@@ -17,7 +17,7 @@ from PyFT8.time_utils import global_time_utils
 from PyFT8.transmitter import AudioOut
 
 from cw_discover.ft8.decode_meta import message_stripped, time_iso_utc
-from cw_discover.ft8.ft8_slot import wait_for_tx_period
+from cw_discover.ft8.ft8_slot import seconds_until_tx_period
 from cw_discover.ft8.ptt_client import PttBackend, NullPtt
 from cw_discover.ft8.tx_safety import LINE_OUT_SINK, LineOutGuard
 
@@ -93,15 +93,30 @@ class Ft8TxPlayer:
     subprocess.run(["pactl", "set-sink-volume", sink, "90%"], check=False, capture_output=True)
     self._line_out_ready = True
 
-  def wait_for_tx_slot(self, tx_period: int | None = None) -> None:
+  def wait_for_tx_slot(
+    self,
+    tx_period: int | None = None,
+    *,
+    should_abort: Callable[[], bool] | None = None,
+  ) -> None:
+    def aborted() -> bool:
+      return should_abort is not None and should_abort()
+
     if tx_period is not None:
-      wait_for_tx_period(tx_period)
+      while not aborted():
+        delay = seconds_until_tx_period(tx_period)
+        if delay <= 0:
+          return
+        time.sleep(min(delay, 0.25 if delay > 1.0 else delay))
       return
-    ct = global_time_utils.cycle_time()
-    if ct > MAX_TX_START_SECONDS:
+    while not aborted():
+      ct = global_time_utils.cycle_time()
+      if ct <= MAX_TX_START_SECONDS:
+        return
       delay = 15.25 - ct
-      if delay > 0:
-        time.sleep(delay)
+      if delay <= 0:
+        return
+      time.sleep(min(delay, 0.25))
 
   def build_wave(self, message: str, audio_hz: float) -> np.ndarray | None:
     parts = message_stripped(message).split()
@@ -134,6 +149,47 @@ class Ft8TxPlayer:
     m = np.asarray(mono, dtype=np.float32).reshape(-1)
     return np.column_stack([m, m])
 
+  @staticmethod
+  def halt_audio() -> None:
+    """Hang leállítás — Stop / kilépés / epoch megszakítás (nem blokkol)."""
+    try:
+      sd.stop()
+    except Exception:
+      pass
+
+  def force_ptt_off(self, attempts: int = 3) -> None:
+    for i in range(attempts):
+      try:
+        self.ptt.ptt_off()
+      except Exception:
+        pass
+      if i + 1 < attempts:
+        time.sleep(0.03)
+
+  def _play_interruptible(
+    self,
+    stereo: np.ndarray,
+    *,
+    should_abort: Callable[[], bool] | None = None,
+  ) -> bool:
+    """True = teljes lejátszás, False = megszakítva (sd.stop / should_abort)."""
+    duration = len(stereo) / FS
+    sd.play(stereo, FS, device=self.audio_device, blocking=False)
+    end_at = time.monotonic() + duration + 0.35
+    while time.monotonic() < end_at:
+      if should_abort is not None and should_abort():
+        self.halt_audio()
+        return False
+      try:
+        stream = sd.get_stream()
+        if stream is None or not stream.active:
+          return True
+      except Exception:
+        return True
+      time.sleep(0.02)
+    self.halt_audio()
+    return False
+
   def transmit(
     self,
     message: str,
@@ -155,28 +211,34 @@ class Ft8TxPlayer:
       self._log_tx("ENCODE_FAIL", message)
       return TxResult(message=message, audio_hz=audio_hz, ok=False, error="encode_failed")
 
-    with self._lock:
-      self.wait_for_tx_slot(tx_period)
-      if should_abort is not None and should_abort():
-        self._log_tx("TX_CANCEL", message)
-        return TxResult(message=message, audio_hz=audio_hz, ok=False, error="cancelled")
-      self._ensure_line_out()
-      period_note = f" p{tx_period}" if tx_period is not None else ""
-      self._emit_state(True, message)
-      self._log_tx("TX_START", message, f"{audio_hz:.0f} Hz{period_note}")
-      try:
-        if not self.ptt.ptt_on():
-          err = getattr(self.ptt, "last_error", "") or "ptt_on_failed"
-          self._log_tx("PTT_FAIL", message, err)
-          return TxResult(message=message, audio_hz=audio_hz, ok=False, error=err)
-        stereo = self._mono_to_stereo(wave)
-        with self._pulse_sink_env():
-          sd.play(stereo, FS, device=self.audio_device, blocking=True)
-      except Exception as exc:
-        self._log_tx("AUDIO_FAIL", message, str(exc))
-        return TxResult(message=message, audio_hz=audio_hz, ok=False, error=str(exc))
-      finally:
-        self.ptt.ptt_off()
-        self._emit_state(False, message)
-      self._log_tx("TX_OK", message)
-      return TxResult(message=message, audio_hz=audio_hz, ok=True)
+    self.wait_for_tx_slot(tx_period, should_abort=should_abort)
+    if should_abort is not None and should_abort():
+      self._log_tx("TX_CANCEL", message)
+      return TxResult(message=message, audio_hz=audio_hz, ok=False, error="cancelled")
+    self._ensure_line_out()
+    period_note = f" p{tx_period}" if tx_period is not None else ""
+    self._emit_state(True, message)
+    self._log_tx("TX_START", message, f"{audio_hz:.0f} Hz{period_note}")
+    aborted = False
+    ptt_err = ""
+    try:
+      if not self.ptt.ptt_on():
+        ptt_err = getattr(self.ptt, "last_error", "") or "ptt_on_failed"
+        self._log_tx("PTT_FAIL", message, ptt_err)
+        return TxResult(message=message, audio_hz=audio_hz, ok=False, error=ptt_err)
+      stereo = self._mono_to_stereo(wave)
+      with self._pulse_sink_env():
+        if not self._play_interruptible(stereo, should_abort=should_abort):
+          aborted = True
+    except Exception as exc:
+      self._log_tx("AUDIO_FAIL", message, str(exc))
+      return TxResult(message=message, audio_hz=audio_hz, ok=False, error=str(exc))
+    finally:
+      self.force_ptt_off()
+      err_note = "aborted" if aborted else ptt_err
+      self._emit_state(False, message, err_note)
+    if aborted:
+      self._log_tx("TX_ABORT", message)
+      return TxResult(message=message, audio_hz=audio_hz, ok=False, error="aborted")
+    self._log_tx("TX_OK", message)
+    return TxResult(message=message, audio_hz=audio_hz, ok=True)

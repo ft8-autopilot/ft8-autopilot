@@ -17,13 +17,17 @@ from cw_discover.ft8.ptt_client import PttBackend
 
 log = logging.getLogger(__name__)
 
-MAX_CONTINUOUS_PTT_SECONDS = 25.0
+MAX_CONTINUOUS_PTT_SECONDS = 20.0
 WATCHDOG_POLL_SECONDS = 0.5
 LINE_GUARD_POLL_SECONDS = 1.0
+PACTL_BACKOFF_SECONDS = 12.0
 from cw_discover.paths import TX_LOG
 
 # Vonalkimenet (FT-817 audio) — ne a régi .3 suffix
 LINE_OUT_SINK = "alsa_output.pci-0000_00_1f.3.analog-stereo"
+
+_pactl_lock = threading.Lock()
+_pactl_backoff_until = 0.0
 
 
 def _log_safety(event: str, detail: str = "") -> None:
@@ -39,13 +43,32 @@ def _log_safety(event: str, detail: str = "") -> None:
     pass
 
 
-def _pactl(*args: str) -> subprocess.CompletedProcess[str]:
-  return subprocess.run(
-    ["pactl", *args],
-    capture_output=True,
-    text=True,
-    check=False,
-  )
+def _pactl(*args: str, timeout: float = 2.0) -> subprocess.CompletedProcess[str]:
+  global _pactl_backoff_until
+  with _pactl_lock:
+    if time.monotonic() < _pactl_backoff_until:
+      return subprocess.CompletedProcess(
+        args=["pactl", *args], returncode=124, stdout="", stderr="backoff"
+      )
+    try:
+      proc = subprocess.run(
+        ["pactl", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+      )
+    except subprocess.TimeoutExpired:
+      _pactl_backoff_until = time.monotonic() + PACTL_BACKOFF_SECONDS
+      log.warning("pactl timeout: %s", " ".join(args))
+      try:
+        from cw_discover.gui.error_journal import report_error
+
+        report_error("audio_pactl_timeout", " ".join(args))
+      except Exception:
+        pass
+      return subprocess.CompletedProcess(args=["pactl", *args], returncode=124, stdout="", stderr="timeout")
+    return proc
 
 
 def _default_sink() -> str:
@@ -107,7 +130,7 @@ def _input_pid(row: dict) -> int | None:
 
 
 class PttWatchdog:
-  """Ragadó PTT: 25 mp folyamatos adás → kényszerleállítás."""
+  """Ragadó PTT: 20 mp folyamatos adás → kényszerleállítás."""
 
   def __init__(
     self,
@@ -131,6 +154,8 @@ class PttWatchdog:
 
   def stop(self) -> None:
     self._stop.set()
+    if self._thread.is_alive():
+      self._thread.join(timeout=2.0)
 
   def reset(self) -> None:
     with self._lock:
@@ -251,7 +276,7 @@ class LineOutGuard:
     self._line_sink = line_sink
     self._enabled = enabled
     self._pid = os.getpid()
-    self._line_index = _sink_index(line_sink)
+    self._line_index: int | None = None
     self._saved_default = ""
     self._fallback_sink = ""
     self._stop = threading.Event()
@@ -277,6 +302,12 @@ class LineOutGuard:
     self._line_index = _sink_index(self._line_sink)
     if self._line_index is None:
       log.warning("Line-out sink nem található: %s", self._line_sink)
+      try:
+        from cw_discover.gui.error_journal import report_error
+
+        report_error("audio_line_sink_missing", self._line_sink)
+      except Exception:
+        pass
       return
     self._saved_default = _default_sink()
     self._fallback_sink = _fallback_sink(self._line_sink)

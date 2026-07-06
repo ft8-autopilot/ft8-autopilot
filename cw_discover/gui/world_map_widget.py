@@ -50,6 +50,19 @@ def _load_land_polygons() -> list[np.ndarray]:
   return polys
 
 
+class SafeFigureCanvas(FigureCanvas):
+  """Matplotlib crash elkerülése — nulla/negatív splitter méretnél."""
+
+  def resizeEvent(self, event) -> None:
+    sz = event.size()
+    if sz.width() < 8 or sz.height() < 8:
+      return
+    try:
+      super().resizeEvent(event)
+    except ValueError:
+      pass
+
+
 class WorldMapWidget(QtWidgets.QWidget):
   def __init__(self, parent=None) -> None:
     super().__init__(parent)
@@ -65,7 +78,7 @@ class WorldMapWidget(QtWidgets.QWidget):
     self._static_ready = False
     self._dynamic_artists: list = []
     self.fig = Figure(figsize=(10, 3.2), facecolor="#0d1117")
-    self.canvas = FigureCanvas(self.fig)
+    self.canvas = SafeFigureCanvas(self.fig)
     self.ax = self.fig.add_subplot(111)
     layout = QtWidgets.QVBoxLayout(self)
     layout.setContentsMargins(0, 0, 0, 0)

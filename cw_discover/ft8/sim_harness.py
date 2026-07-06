@@ -41,6 +41,12 @@ class RecordingTx:
   def clear(self) -> None:
     self.calls.clear()
 
+  def halt_audio(self) -> None:
+    pass
+
+  def force_ptt_off(self) -> None:
+    pass
+
 
 @dataclass
 class SimStep:

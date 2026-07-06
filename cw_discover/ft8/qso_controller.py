@@ -38,6 +38,7 @@ from cw_discover.ft8.ft8_slot import (
 from cw_discover.ft8.home_qth import DEFAULT_HOME, HOME_LAT, HOME_LON
 from cw_discover.ft8.pro_operator import (
   ContactIntelCache,
+  PriorityMode,
   ProOperatorConfig,
   geo_distance_for_cq,
   pick_best_cq,
@@ -151,8 +152,30 @@ class Ft8AutoOperator:
       self._incoming_buffer.clear()
       self._drain_tx_queue()
       self._queued_slot_id = ""
+    self._halt_rf()
     if old:
       self._status(f"Feladva: {old}" + (f" ({reason})" if reason else ""))
+
+  def _halt_rf(self) -> None:
+    """PTT + hang azonnali leállítás (Stop, kilépés, abort)."""
+    self.tx.halt_audio()
+    self.tx.force_ptt_off()
+
+  def halt_transmission(self, reason: str = "") -> None:
+    """Teljes TX leállítás — QSO közben is, várakozó sor és aktív adás."""
+    with self._lock:
+      self.armed = False
+      self._active = None
+      self._phase = QsoPhase.IDLE
+      self._cq_wait_remaining = 0
+      self._last_tx_msg = ""
+      self._cq_buffer.clear()
+      self._incoming_buffer.clear()
+      self._drain_tx_queue()
+      self._queued_slot_id = ""
+    self._halt_rf()
+    if reason:
+      self._status(f"TX leállítva ({reason})")
 
   def engage_call(
     self,
@@ -174,7 +197,9 @@ class Ft8AutoOperator:
     self._begin_qso(call, grid, audio_hz, heard_period=ft8_period_at())
     if rx_report and is_report(rx_report):
       self._active.rst_rcvd = rst_from_report_token(rx_report)
-      self._queue_tx(f"{call} {me} R{snr_report_text(rx_snr)}", audio_hz)
+      rst = snr_report_text(rx_snr)
+      self._active.rst_sent = rst
+      self._queue_tx(f"{call} {me} R{rst}", audio_hz)
       self._status(f"PRO → {call} (jelentés {rx_report})")
     else:
       self._queue_tx(f"{call} {me} {self._my_grid4}", audio_hz)
@@ -278,6 +303,7 @@ class Ft8AutoOperator:
 
   def set_armed(self, on: bool) -> None:
     with self._lock:
+      was = self.armed
       self.armed = on
       if not on:
         self._active = None
@@ -285,6 +311,11 @@ class Ft8AutoOperator:
         self._cq_wait_remaining = 0
         self._cq_buffer.clear()
         self._incoming_buffer.clear()
+        self._drain_tx_queue()
+      elif not was:
+        self._last_cycle_key = ""
+        self._cq_tx_period = None
+        self._cq_wait_remaining = 0
     mode = self._armed_mode_label()
     self._status("PTT OFF" if not on else f"PTT ARMED ({mode})")
 
@@ -317,6 +348,21 @@ class Ft8AutoOperator:
         del self._outbound_cooldown[cu]
         return False
       return True
+
+  def outbound_cooldown_calls(self) -> set[str]:
+    """Outbound 10 perces szünet — GUI halvány kiemeléshez."""
+    now = time.monotonic()
+    with self._lock:
+      active: set[str] = set()
+      expired: list[str] = []
+      for call, exp in self._outbound_cooldown.items():
+        if now < exp:
+          active.add(call)
+        else:
+          expired.append(call)
+      for call in expired:
+        del self._outbound_cooldown[call]
+      return active
 
   @property
   def phase(self) -> QsoPhase:
@@ -531,6 +577,8 @@ class Ft8AutoOperator:
         self._status(f"CQ üzem jelölt: {incoming} score={cand.score:.0f} ({cand.reason})")
       return True
 
+    g4 = grid4_upper(grid or triplet.third)
+    fast = self._prefer_fast_report() and bool(g4)
     self._answer_incoming(
       incoming,
       grid or triplet.third,
@@ -538,9 +586,14 @@ class Ft8AutoOperator:
       None,
       report.snr,
       cycle=report.cycle,
-      skip_our_grid=False,
+      skip_our_grid=fast,
+      reason="gyors riport" if fast else "",
     )
     return True
+
+  def _prefer_fast_report(self) -> bool:
+    pro = self.station.pro
+    return pro.enabled and pro.priority == PriorityMode.STRONG_FAST
 
   def _maybe_answer_cq(self, triplet, report: DecodeReport) -> None:
     if self._cq_only_mode:
@@ -587,6 +640,13 @@ class Ft8AutoOperator:
     heard = period_from_cycle(cycle) if cycle else ft8_period_at()
     self._begin_qso(call, grid, audio_hz, heard_period=heard)
     self._default_tx_hz = audio_hz
+    if self._prefer_fast_report() and grid4_upper(grid):
+      rst = snr_report_text(snr)
+      self._queue_tx(f"{call} {self._me_callsign} {rst}", audio_hz)
+      self._active.rst_sent = rst
+      tag = f"{reason}, gyors riport" if reason else "gyors riport"
+      self._status(f"CQ → {call} SNR{snr:+d} ({tag}) slot TX={self._active.tx_period}")
+      return
     msg = f"{call} {self._me_callsign} {self._my_grid4}"
     self._queue_tx(msg, audio_hz)
     self._status(f"CQ → {call} SNR{snr:+d} ({reason}) slot TX={self._active.tx_period}")
@@ -609,7 +669,10 @@ class Ft8AutoOperator:
     me = self._me_callsign
     if rx_report and is_report(rx_report) and not is_r_report(rx_report):
       self._active.rst_rcvd = rst_from_report_token(rx_report)
-      self._queue_tx(f"{call} {me} R{snr_report_text(snr)}", audio_hz)
+      rst = snr_report_text(snr)
+      if not self._active.rst_sent:
+        self._active.rst_sent = rst
+      self._queue_tx(f"{call} {me} R{rst}", audio_hz)
       self._status(f"Bejövő → {call} ({rx_report})")
       return
     if skip_our_grid:
@@ -704,7 +767,10 @@ class Ft8AutoOperator:
       if o.rst_rcvd:
         return True
       o.rst_rcvd = rst_from_report_token(third)
-      self._queue_tx(f"{o.remote_call} {me} R{snr_report_text(report.snr)}", o.audio_hz)
+      rst = snr_report_text(report.snr)
+      if not o.rst_sent:
+        o.rst_sent = rst
+      self._queue_tx(f"{o.remote_call} {me} R{rst}", o.audio_hz)
       return True
     if is_r_report(third) or is_rrr(third):
       if self._phase == QsoPhase.CLOSING:
@@ -801,5 +867,12 @@ class Ft8AutoOperator:
   def _status(self, text: str) -> None:
     self._on_status(text)
 
-  def shutdown(self) -> None:
+  def shutdown(self, *, spin: Callable[[], None] | None = None) -> None:
+    """Leállítás: TX megszakítás, worker join (GUI kilépés)."""
+    self.halt_transmission()
     self._tx_queue.put(None)
+    deadline = time.monotonic() + 8.0
+    while self._worker.is_alive() and time.monotonic() < deadline:
+      if spin is not None:
+        spin()
+      self._worker.join(timeout=0.05)

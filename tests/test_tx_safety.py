@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cw_discover.ft8.ptt_client import Esp32Ptt, NullPtt
 from cw_discover.ft8.safety_manager import (
   SafetySnapshot,
@@ -17,6 +19,22 @@ from cw_discover.ft8.tx_safety import (
   WatchdogPtt,
   wrap_ptt_with_watchdog,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_live_audio() -> None:
+  """Ne hívjon valódi pactl / sd.stop-ot — GUI és PulseAudio védelem."""
+  noop_pactl = MagicMock(returncode=0, stdout="", stderr="")
+  with (
+    patch("cw_discover.ft8.tx_safety.sd.stop"),
+    patch("cw_discover.ft8.tx_safety._pactl", return_value=noop_pactl),
+    patch("cw_discover.ft8.tx_safety._list_sinks", return_value=[]),
+    patch("cw_discover.ft8.tx_safety._sink_index", return_value=None),
+    patch("cw_discover.ft8.tx_safety._default_sink", return_value=""),
+    patch("cw_discover.ft8.tx_safety._fallback_sink", return_value="hdmi"),
+    patch("cw_discover.ft8.tx_safety._sink_input_rows", return_value=[]),
+  ):
+    yield
 
 
 def test_watchdog_ptt_tracks_on_off() -> None:
@@ -57,6 +75,7 @@ def test_watchdog_reset_restarts() -> None:
   wd = PttWatchdog(inner, enabled=True)
   wd.start()
   wd.stop()
+  assert not wd._thread.is_alive()
   wd.reset()
   assert not wd._triggered
 
@@ -100,20 +119,20 @@ def test_wrap_ptt_with_watchdog() -> None:
   wrapped, wd = wrap_ptt_with_watchdog(inner, enabled=True)
   assert isinstance(wrapped, WatchdogPtt)
   assert isinstance(wd, PttWatchdog)
+  wd.stop()
 
 
 def test_esp32_shutdown_resume() -> None:
   ptt = Esp32Ptt(port="/dev/null")
-  with patch.object(ptt, "_cmd") as mock_cmd:
-    mock_cmd.side_effect = [
+  with patch.object(ptt, "_cmd_unlocked") as mock_unlocked:
+    mock_unlocked.side_effect = [
       ["OK PTT 0"],
       ["OK PTT 0"],
       ["OK PTT 0"],
       ["OK SHUTDOWN"],
     ]
-    ptt._ser = MagicMock()
     assert ptt.shutdown()
-    mock_cmd.assert_any_call("SHUTDOWN")
+    mock_unlocked.assert_any_call("SHUTDOWN")
 
   with patch.object(ptt, "_cmd", return_value=["OK RESUME"]):
     assert ptt.resume()

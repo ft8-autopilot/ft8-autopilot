@@ -52,21 +52,28 @@ class Esp32Ptt:
     time.sleep(0.15)
     return self._ser
 
+  def _cmd_unlocked(self, line: str, wait: float = 0.25) -> list[str]:
+    """Soros parancs — a hívó már tartja a self._lock-ot (close/shutdown)."""
+    try:
+      ser = self._open()
+      ser.reset_input_buffer()
+      ser.write((line.strip() + "\n").encode())
+      ser.flush()
+      time.sleep(wait)
+      out: list[str] = []
+      while ser.in_waiting:
+        out.append(ser.readline().decode(errors="replace").strip())
+      for ln in out:
+        if "WARN PTT_STUCK" in ln:
+          self.last_error = ln
+      return out
+    except Exception as exc:
+      self.last_error = f"{line}: {exc}"
+      return []
+
   def _cmd(self, line: str, wait: float = 0.25) -> list[str]:
     with self._lock:
-      try:
-        ser = self._open()
-        ser.reset_input_buffer()
-        ser.write((line.strip() + "\n").encode())
-        ser.flush()
-        time.sleep(wait)
-        out: list[str] = []
-        while ser.in_waiting:
-          out.append(ser.readline().decode(errors="replace").strip())
-        return out
-      except Exception as exc:
-        self.last_error = f"{line}: {exc}"
-        return []
+      return self._cmd_unlocked(line, wait)
 
   def ping(self) -> bool:
     lines = self._cmd("PING")
@@ -74,6 +81,22 @@ class Esp32Ptt:
     if not ok:
       self.last_error = f"PING nincs PONG: {lines!r}"
     return ok
+
+  def status(self) -> dict[str, int | bool]:
+    """ESP STATUS → TIME, PTT, LOCK."""
+    out: dict[str, int | bool] = {"ptt": 0, "lock": False}
+    for ln in self._cmd("STATUS", wait=0.35):
+      if "LOCK=" in ln:
+        try:
+          out["lock"] = ln.split("LOCK=")[1].strip().startswith("1")
+        except IndexError:
+          pass
+      if "PTT=" in ln:
+        try:
+          out["ptt"] = int(ln.split("PTT=")[1].split()[0])
+        except (IndexError, ValueError):
+          pass
+    return out
 
   @staticmethod
   def _ptt_ok(lines: list[str], want: str) -> bool:
@@ -106,9 +129,9 @@ class Esp32Ptt:
     with self._lock:
       ok = False
       for _ in range(3):
-        lines = self._cmd("PTT 0")
+        lines = self._cmd_unlocked("PTT 0")
         ok = self._ptt_ok(lines, "0") or ok
-      lines = self._cmd("SHUTDOWN")
+      lines = self._cmd_unlocked("SHUTDOWN")
       ok = self._cmd_ok(lines, "SHUTDOWN") or ok
       if self._ser is not None:
         try:
@@ -129,7 +152,7 @@ class Esp32Ptt:
     with self._lock:
       if self._ser is not None:
         try:
-          self._cmd("PTT 0")
+          self._cmd_unlocked("PTT 0")
           self._ser.close()
         except Exception:
           pass

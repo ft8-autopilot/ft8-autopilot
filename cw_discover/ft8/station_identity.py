@@ -27,7 +27,7 @@ class StationIdentity:
   operator_legal_name: str = ""
   qth: str = "Example City"
   qth_detail: str = ""
-  country: str = "United States"
+  country: str = "Magyarország"
   tx_power_w: int = 5
   ptt_port: str = "/dev/ttyUSB0"
   ptt_baud: int = 115200
@@ -53,7 +53,7 @@ class StationIdentity:
       operator_legal_name=str(data.get("operator_legal_name", "")),
       qth=str(data.get("qth", "Example City")),
       qth_detail=str(data.get("qth_detail", "")),
-      country=str(data.get("country", "United States")),
+      country=str(data.get("country", "Magyarország")),
       tx_power_w=int(data.get("tx_power_w", 5)),
       ptt_port=str(data.get("ptt_port", "/dev/ttyUSB0")),
       ptt_baud=int(data.get("ptt_baud", 115200)),

@@ -1,7 +1,7 @@
 # FT8 automata operátor — 50 kötelező viselkedés
 
 **Források:** WSJT-X 2.x FT8 üzemmód, PyFT8 `progress_qso`, cw-discover 31k+ dekód
-elemzés, KK5JY / WSJT-Z / Auto-FT8 best practice, field experience.
+elemzés, KK5JY / WSJT-Z / Auto-FT8 best practice, N0CALL állomás tapasztalat.
 
 **Cél:** A `Ft8AutoOperator` + `Ft8TxPlayer` + GUI viselkedése egyezik a szabványos
 FT8 fél-duplex QSO-val.

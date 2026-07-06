@@ -129,6 +129,32 @@ def test_shutdown_tx_worker(tmp_path) -> None:
   assert not op._worker.is_alive()
 
 
+def test_esp32_ptt_close_no_deadlock() -> None:
+  """close() korábban _cmd()-ot hívott lock alatt → örök deadlock ha _ser nyitva."""
+  from unittest.mock import MagicMock
+
+  from cw_discover.ft8.ptt_client import Esp32Ptt
+
+  ptt = Esp32Ptt("/dev/ttyTEST")
+  mock_ser = MagicMock()
+  mock_ser.in_waiting = 0
+  ptt._ser = mock_ser
+  err: list[BaseException] = []
+
+  def work() -> None:
+    try:
+      ptt.close()
+    except BaseException as exc:
+      err.append(exc)
+
+  t = threading.Thread(target=work, daemon=True)
+  t.start()
+  t.join(timeout=1.0)
+  assert not t.is_alive(), "Esp32Ptt.close() deadlock"
+  assert not err
+  assert ptt._ser is None
+
+
 # --- 6: PTT hiba ---
 
 

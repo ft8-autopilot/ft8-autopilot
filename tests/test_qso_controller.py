@@ -46,6 +46,34 @@ def test_answer_cq(tmp_path) -> None:
   assert op._active.remote_call == "IK4LZH"
 
 
+def test_strong_fast_cq_answer_skips_grid(tmp_path) -> None:
+  from cw_discover.ft8.pro_operator import PriorityMode, ProOperatorConfig
+
+  pro = ProOperatorConfig(enabled=True, priority=PriorityMode.STRONG_FAST, defer_cq_pick=False)
+  st = StationIdentity(callsign="N0CALL", grid="JN96", cq_min_snr=-20, ptt_port="", pro=pro)
+  op = Ft8AutoOperator(
+    station=st, naplo=ForgalmiNaplo(tmp_path, station=st), tx=Ft8TxPlayer(simulate=True)
+  )
+  op.set_armed(True)
+  op.on_decode(_report("CQ IK4LZH JN54", snr=-8, hz=397))
+  assert op._last_tx_msg == "IK4LZH N0CALL -08"
+  assert "JN96" not in op._last_tx_msg
+
+
+def test_strong_fast_incoming_grid_skips_our_grid(tmp_path) -> None:
+  from cw_discover.ft8.pro_operator import PriorityMode, ProOperatorConfig
+
+  pro = ProOperatorConfig(enabled=True, priority=PriorityMode.STRONG_FAST, defer_cq_pick=False)
+  st = StationIdentity(callsign="N0CALL", grid="JN96", ptt_port="", pro=pro)
+  op = Ft8AutoOperator(
+    station=st, naplo=ForgalmiNaplo(tmp_path, station=st), tx=Ft8TxPlayer(simulate=True)
+  )
+  op.set_armed(True)
+  op.on_decode(_report("IK4LZH N0CALL JN54", snr=-10, hz=397))
+  assert op._last_tx_msg == "IK4LZH N0CALL -10"
+  assert "JN96" not in op._last_tx_msg
+
+
 def test_incoming_call(tmp_path) -> None:
   st = StationIdentity(callsign="N0CALL", grid="JN96", ptt_port="")
   naplo = ForgalmiNaplo(tmp_path, station=st)
@@ -400,6 +428,8 @@ def test_reversed_report_while_calling_cq_answers(tmp_path) -> None:
   assert op._active is not None
   assert op._active.remote_call == "IZ8PPI"
   assert op._last_tx_msg == "IZ8PPI N0CALL R-11"
+  assert op._active.rst_sent == "-11"
+  assert op._active.rst_rcvd == "+00"
 
 
 def test_cq_wait_then_repeat_cq(tmp_path) -> None:

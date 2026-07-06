@@ -365,7 +365,7 @@ def analyze(rows: list[dict]) -> dict[str, Any]:
       "generated_at": datetime.now(tz=timezone.utc).isoformat(),
       "decode_count": n,
       "log_days": sorted({r.get("time_iso", "")[:10] for r in rows if r.get("time_iso")}),
-      "home_qth": "Example QTH JN96",
+      "home_qth": "Example City FN31",
       "band": "40m",
       "dial_mhz": 7.074,
     },

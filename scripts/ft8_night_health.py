@@ -19,12 +19,63 @@ LIVE = FORGALMI_LIVE
 GUI_STATUS = LIVE / "gui_status.json"
 STATE_PATH = LIVE / "night_watch_state.json"
 WATCH_LOG = LIVE / "night_watch.log"
-START_SCRIPT = ROOT / "scripts" / "start_auto_ft8.sh"
+START_SCRIPT = ROOT / "scripts" / "start_overnight_40m.sh"
 OPERATOR_IN = LIVE / "operator_in.txt"
+
+EXPECTED_BAND = "40m"
+EXPECTED_DIAL = 7.074
+DIAL_TOL = 0.002
+EXPECTED_CQ_ONLY = False
+EXPECTED_PRO_PRIORITY = "balanced"
+EXPECTED_CQ_WAIT = 1
+EXPECTED_MAP = False
 
 STALE_STATUS_SEC = 180
 STUCK_TX_SEC = 90
-FLAT_DECODE_CHECKS = 3  # 3×30 perc dekód nélkül + nincs TX → restart
+FLAT_DECODE_CHECKS = 3  # 3×30 perc dekód nélkül → restart
+PENDING_RESTART_MAX_SEC = 900  # max 15 perc várakozás aktív QSO-ra
+QSO_BUSY_PHASES = frozenset({"active", "closing"})
+
+
+def qso_in_progress(st: dict) -> bool:
+  phase = str(st.get("qso_phase", "idle"))
+  partner = str(st.get("qso_partner", "")).strip()
+  return phase in QSO_BUSY_PHASES and bool(partner)
+
+
+def is_critical_restart(reasons: list[str]) -> bool:
+  """Azonnali restart — QSO várakozás nélkül."""
+  joined = " | ".join(reasons)
+  if "run_ft8_gui.py nem fut" in joined:
+    return True
+  if "hiányzik vagy sérült" in joined:
+    return True
+  if "safety_tripped" in joined:
+    return True
+  if "gui_status elavult" in joined:
+    # 10+ perc teljes csend — akkor is restart, QSO-t is fel kell adni
+    for r in reasons:
+      if "elavult" in r:
+        try:
+          sec = float(r.split("(")[1].split("s")[0])
+          if sec > 600:
+            return True
+        except (IndexError, ValueError):
+          return True
+  return False
+
+
+def pending_restart_expired(state: dict) -> bool:
+  raw = state.get("pending_restart_since")
+  if not raw:
+    return False
+  try:
+    ts = datetime.fromisoformat(str(raw))
+    if ts.tzinfo is None:
+      ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() > PENDING_RESTART_MAX_SEC
+  except ValueError:
+    return True
 
 
 def log(msg: str) -> None:
@@ -141,6 +192,20 @@ def save_state(**fields) -> None:
 
 def soft_fix(st: dict) -> list[str]:
   cmds: list[str] = []
+  band = str(st.get("band", ""))
+  dial = float(st.get("dial_mhz") or 0)
+  if band != EXPECTED_BAND:
+    cmds.append(f"BAND {EXPECTED_BAND}")
+  if abs(dial - EXPECTED_DIAL) > DIAL_TOL:
+    cmds.append(f"DIAL {EXPECTED_DIAL:.3f}")
+  if bool(st.get("cq_only_mode")) != EXPECTED_CQ_ONLY:
+    cmds.append("CQ_MODE_OFF")
+  if str(st.get("pro_priority", "")).lower() != EXPECTED_PRO_PRIORITY:
+    cmds.append(f"PRO_PRIORITY {EXPECTED_PRO_PRIORITY}")
+  if bool(st.get("map_visible", True)) != EXPECTED_MAP:
+    cmds.append("MAP_OFF")
+  if int(st.get("cq_wait_periods") or 0) != EXPECTED_CQ_WAIT:
+    cmds.append(f"CQ_WAIT {EXPECTED_CQ_WAIT}")
   if not st.get("rx_running"):
     cmds.append("START_RX")
   if not st.get("pro_operator"):
@@ -153,13 +218,12 @@ def soft_fix(st: dict) -> list[str]:
   return cmds
 
 
-def hard_restart(cq_only: bool) -> None:
-  log(f"HARD RESTART (cq_only={cq_only})")
+def hard_restart() -> None:
+  log("HARD RESTART (40m kiegyensúlyozott)")
+  save_state(pending_restart=False, pending_restart_reasons=[], pending_restart_since="")
   subprocess.run(["bash", str(START_SCRIPT)], check=False, timeout=120)
   time.sleep(8)
-  mode = "CQ_MODE_ON" if cq_only else "CQ_MODE_OFF"
-  OPERATOR_IN.write_text(f"{mode}\n", encoding="utf-8")
-  log(f"post-restart: {mode}")
+  log("post-restart: start_overnight_40m.sh lefutott")
 
 
 def assess() -> tuple[str, list[str]]:
@@ -213,16 +277,22 @@ def assess() -> tuple[str, list[str]]:
     cq_only_mode=st.get("cq_only_mode"),
   )
 
-  if flat_count >= FLAT_DECODE_CHECKS and not st.get("rx_running"):
-    return "restart", [f"nincs dekód/TX {flat_count} ellenőrzés óta, RX sem fut"]
+  if flat_count >= FLAT_DECODE_CHECKS:
+    return "restart", [f"nincs új dekód {flat_count} ellenőrzés óta (~{flat_count * 30} perc)"]
 
   soft_needed = (
     not st.get("rx_running")
     or not st.get("pro_operator")
     or not st.get("ptt_armed")
+    or str(st.get("band", "")) != EXPECTED_BAND
+    or abs(float(st.get("dial_mhz") or 0) - EXPECTED_DIAL) > DIAL_TOL
+    or bool(st.get("cq_only_mode")) != EXPECTED_CQ_ONLY
+    or str(st.get("pro_priority", "")).lower() != EXPECTED_PRO_PRIORITY
+    or bool(st.get("map_visible", True)) != EXPECTED_MAP
+    or int(st.get("cq_wait_periods") or 0) != EXPECTED_CQ_WAIT
   )
   if soft_needed:
-    return "soft", ["RX/PRO/PTT kikapcsolva"]
+    return "soft", ["RX/PRO/PTT/sáv/mód javítás szükséges"]
 
   if not bridge_running():
     return "soft", ["ft8_live_bridge.py nem fut — auto_watch kezeli"]
@@ -232,8 +302,22 @@ def assess() -> tuple[str, list[str]]:
 
 def main() -> int:
   st = load_status()
+  state = load_state()
+
+  # Korábban halasztott restart — QSO vége után most
+  if state.get("pending_restart") and not qso_in_progress(st):
+    reasons = state.get("pending_restart_reasons") or ["halasztott restart"]
+    log("halasztott RESTART — QSO véget ért: " + "; ".join(reasons))
+    hard_restart()
+    time.sleep(5)
+    v2, r2 = assess()
+    if v2 == "ok":
+      log("RESTART sikeres")
+      return 0
+    log("RESTART után még gond: " + "; ".join(r2))
+    return 1
+
   verdict, reasons = assess()
-  cq_only = bool(st.get("cq_only_mode", False))
 
   summary = {
     "verdict": verdict,
@@ -241,16 +325,27 @@ def main() -> int:
     "phase": st.get("qso_phase"),
     "partner": st.get("qso_partner"),
     "decode_count": st.get("decode_count"),
+    "band": st.get("band"),
+    "dial_mhz": st.get("dial_mhz"),
     "rx": st.get("rx_running"),
     "ptt": st.get("ptt_armed"),
     "pro": st.get("pro_operator"),
-    "cq_only": cq_only,
+    "cq_only": st.get("cq_only_mode"),
+    "pro_priority": st.get("pro_priority"),
     "safety_tripped": st.get("safety_tripped"),
+    "qso_busy": qso_in_progress(st),
+    "pending_restart": bool(state.get("pending_restart")),
   }
   log("check: " + json.dumps(summary, ensure_ascii=False))
 
   if verdict == "ok":
-    log("OK — nincs beavatkozás")
+    if state.get("pending_restart") and qso_in_progress(st):
+      log(
+        f"QSO folyamatban ({st.get('qso_partner')}, {st.get('qso_phase')}) — "
+        f"halasztott restart vár"
+      )
+    else:
+      log("OK — nincs beavatkozás")
     return 0
 
   if verdict == "soft":
@@ -258,8 +353,25 @@ def main() -> int:
     log("SOFT FIX — várunk")
     return 0
 
-  cq_only = bool(st.get("cq_only_mode", False))
-  hard_restart(cq_only)
+  if qso_in_progress(st) and not is_critical_restart(reasons):
+    if pending_restart_expired(state):
+      log(
+        f"RESTART — QSO halasztás lejárt ({PENDING_RESTART_MAX_SEC}s): "
+        f"{st.get('qso_partner')} ({st.get('qso_phase')})"
+      )
+    else:
+      save_state(
+        pending_restart=True,
+        pending_restart_reasons=reasons,
+        pending_restart_since=state.get("pending_restart_since") or time_iso_utc(time.time()),
+      )
+      log(
+        f"RESTART halasztva — QSO folyamatban: {st.get('qso_partner')} "
+        f"({st.get('qso_phase')}); ok: {reasons}"
+      )
+      return 0
+
+  hard_restart()
   time.sleep(5)
   v2, r2 = assess()
   if v2 == "ok":

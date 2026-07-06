@@ -27,12 +27,12 @@ Bridge thread       ← tail offset only (mmap file)
 ## Merge checklist (prod ← opt)
 
 ```bash
-diff -ru cw-discover/cw_discover/ft8/ft8_slot.py ft8-autopilot/cw_discover/ft8/ft8_slot.py
-diff -ru cw-discover/cw_discover/ft8/atomic_io.py ft8-autopilot/cw_discover/ft8/atomic_io.py
-diff -ru cw-discover/cw_discover/ft8/session_log.py ft8-autopilot/cw_discover/ft8/session_log.py
-diff -ru cw-discover/cw_discover/ft8/virtual_engine.py ft8-autopilot/cw_discover/ft8/virtual_engine.py
-diff -ru cw-discover/cw_discover/gui/ft8_window.py ft8-autopilot/cw_discover/gui/ft8_window.py
-diff -ru cw-discover/scripts/ft8_live_bridge.py ft8-autopilot/scripts/ft8_live_bridge.py
+diff -ru cw-discover/cw_discover/ft8/ft8_slot.py cw-discover-opt/cw_discover/ft8/ft8_slot.py
+diff -ru cw-discover/cw_discover/ft8/atomic_io.py cw-discover-opt/cw_discover/ft8/atomic_io.py
+diff -ru cw-discover/cw_discover/ft8/session_log.py cw-discover-opt/cw_discover/ft8/session_log.py
+diff -ru cw-discover/cw_discover/ft8/virtual_engine.py cw-discover-opt/cw_discover/ft8/virtual_engine.py
+diff -ru cw-discover/cw_discover/gui/ft8_window.py cw-discover-opt/cw_discover/gui/ft8_window.py
+diff -ru cw-discover/scripts/ft8_live_bridge.py cw-discover-opt/scripts/ft8_live_bridge.py
 ```
 
 **Éles merge előtt:** állítsd le az FT8-et, másold át, futtasd pytest, indítsd újra.

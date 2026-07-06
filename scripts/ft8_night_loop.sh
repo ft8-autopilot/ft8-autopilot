@@ -19,5 +19,5 @@ while true; do
     echo 'AGENT_LOOP_DONE_ft8_night {"reason":"8:00 elérve"}'
     exit 0
   fi
-  echo 'AGENT_LOOP_TICK_ft8_night {"prompt":"FT8 éjszakai felügyelet: futtasd ./scripts/ft8_night_health.py ; ha verdict=ok vagy soft, ne nyúlj máshoz; ha restart volt, ellenőrizd gui_status-t és írj rövid összefoglalót the operator."}'
+  echo 'AGENT_LOOP_TICK_ft8_night {"prompt":"FT8 éjszakai felügyelet: futtasd ./scripts/ft8_night_health.py ; ha verdict=ok vagy soft, ne nyúlj máshoz; ha restart volt, ellenőrizd gui_status-t."}'
 done

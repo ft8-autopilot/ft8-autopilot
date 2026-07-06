@@ -178,6 +178,15 @@ class ForgalmiNaplo:
     key = (_call_key(call), _norm_band(band), (mode or "FT8").strip().upper())
     return key in self._worked_today
 
+  def worked_calls_today(self, *, band: str | None = None, mode: str = "FT8") -> set[str]:
+    """Mai UTC napon naplózott QSO partnerek — GUI zöld kiemeléshez."""
+    self._ensure_today_cache()
+    mode_u = (mode or "FT8").strip().upper()
+    if band is None:
+      return {call for call, _b, m in self._worked_today if m == mode_u}
+    nb = _norm_band(band)
+    return {call for call, b, m in self._worked_today if b == nb and m == mode_u}
+
   def append_qso(self, rec: QsoRecord) -> str:
     qso_id = str(uuid.uuid4())
     payload = rec.to_json(station=self.station, qso_id=qso_id)
