@@ -24,7 +24,7 @@ Az FT8 Autopilot Python alkalmazás: [PyFT8](https://pypi.org/project/PyFT8/) de
 ### 1. Klón és venv
 
 ```bash
-git clone https://github.com/Tomsawier92/ft8-autopilot.git
+git clone https://github.com/ft8-autopilot/ft8-autopilot.git
 cd ft8-autopilot
 python3 -m venv .venv
 source .venv/bin/activate

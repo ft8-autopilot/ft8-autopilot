@@ -24,7 +24,7 @@ FT8 Autopilot is a Python application that decodes FT8 on the air (via [PyFT8](h
 ### 1. Clone and virtualenv
 
 ```bash
-git clone https://github.com/Tomsawier92/ft8-autopilot.git
+git clone https://github.com/ft8-autopilot/ft8-autopilot.git
 cd ft8-autopilot
 python3 -m venv .venv
 source .venv/bin/activate
