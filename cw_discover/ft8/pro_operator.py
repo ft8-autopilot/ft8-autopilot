@@ -38,6 +38,9 @@ class ProOperatorConfig:
   prefer_weak_bonus: bool = True
   defer_cq_pick: bool = True
   skip_worked_today: bool = True
+  max_retry_cycles: int | None = None
+  outbound_fail_cooldown_sec: int | None = None
+  preempt_snr_margin_db: float = 3.0
 
   @classmethod
   def from_dict(cls, data: dict | None) -> ProOperatorConfig:
@@ -57,7 +60,35 @@ class ProOperatorConfig:
       prefer_weak_bonus=bool(data.get("prefer_weak_bonus", True)),
       defer_cq_pick=bool(data.get("defer_cq_pick", True)),
       skip_worked_today=bool(data.get("skip_worked_today", True)),
+      max_retry_cycles=(
+        int(data["max_retry_cycles"]) if data.get("max_retry_cycles") is not None else None
+      ),
+      outbound_fail_cooldown_sec=(
+        int(data["outbound_fail_cooldown_sec"])
+        if data.get("outbound_fail_cooldown_sec") is not None
+        else None
+      ),
+      preempt_snr_margin_db=float(data.get("preempt_snr_margin_db", 3.0)),
     )
+
+  def effective_max_retry_cycles(self) -> int:
+    if self.max_retry_cycles is not None:
+      return max(1, int(self.max_retry_cycles))
+    if self.enabled and self.priority == PriorityMode.STRONG_FAST:
+      return 2
+    return 3
+
+  def effective_outbound_cooldown_sec(self) -> int:
+    if self.outbound_fail_cooldown_sec is not None:
+      return max(30, int(self.outbound_fail_cooldown_sec))
+    if self.enabled and self.priority == PriorityMode.STRONG_FAST:
+      return 180
+    return 600
+
+  def effective_defer_cq_pick(self) -> bool:
+    if self.enabled and self.priority == PriorityMode.STRONG_FAST:
+      return False
+    return self.defer_cq_pick
 
 
 @dataclass
@@ -118,27 +149,24 @@ def _directed_cq_match_cached(message_upper: str, home_country: str, home_grid0:
   return True
 
 
-def score_cq_candidate(
+def _score_candidate_core(
   *,
+  call: str,
   report: DecodeReport,
-  triplet: MessageTriplet,
   grid: str,
   distance_km: float | None,
   worked: bool,
   config: ProOperatorConfig,
-  home: HomeQth | None = None,
+  home: HomeQth,
+  is_cq: bool,
 ) -> CqCandidate | None:
-  """CQ jelölt pontozása — magasabb = értékesebb QSO."""
-  home = home or DEFAULT_HOME
-  call = triplet.call_b
+  """Közös PRO pontozás — CQ és bejövő hívás."""
   snr = int(report.snr)
   reasons: list[str] = []
 
-  if snr < config.min_snr:
+  if snr < config.min_snr or snr > config.max_snr:
     return None
-  if snr > config.max_snr:
-    return None
-  if not _directed_cq_match(report.message, home):
+  if is_cq and not _directed_cq_match(report.message, home):
     return None
   if worked and config.skip_worked_today:
     return None
@@ -153,7 +181,6 @@ def score_cq_candidate(
     score = float(dist or 0)
     reasons.append(f"táv {dist or '?'} km")
   elif mode == PriorityMode.WEAK_DX:
-    # Fox: gyenge jel gyakran messzi / értékes; erős = lokális „arms race”
     weak = max(0.0, -float(snr))
     score = weak * 80.0 + float(dist or 0) * 0.8
     if dist and dist > 2000:
@@ -165,7 +192,6 @@ def score_cq_candidate(
     score = float(snr) * 15.0
     reasons.append("erős = gyors QSO")
   else:
-    # balanced — távolság + gyenge bónusz − túl erős büntetés
     score = float(dist or 250) * 0.4
     if config.prefer_weak_bonus and snr < 0:
       score += (-snr) * 12.0
@@ -175,11 +201,10 @@ def score_cq_candidate(
     if grid:
       score += 80.0
 
-  if worked:
+  if is_cq and worked:
     return None
-
   if not reasons:
-    reasons.append(mode.value)
+    reasons.append("bejövő" if not is_cq else mode.value)
 
   return CqCandidate(
     call=call,
@@ -191,6 +216,30 @@ def score_cq_candidate(
     message=report.message,
     reason=", ".join(reasons),
     cycle=report.cycle,
+  )
+
+
+def score_cq_candidate(
+  *,
+  report: DecodeReport,
+  triplet: MessageTriplet,
+  grid: str,
+  distance_km: float | None,
+  worked: bool,
+  config: ProOperatorConfig,
+  home: HomeQth | None = None,
+) -> CqCandidate | None:
+  """CQ jelölt pontozása — magasabb = értékesebb QSO."""
+  home = home or DEFAULT_HOME
+  return _score_candidate_core(
+    call=triplet.call_b,
+    report=report,
+    grid=grid,
+    distance_km=distance_km,
+    worked=worked,
+    config=config,
+    home=home,
+    is_cq=True,
   )
 
 
@@ -206,60 +255,15 @@ def score_incoming_candidate(
 ) -> CqCandidate | None:
   """Bejövő hívás (CALL ME …) — CQ üzem bufferhez."""
   home = home or DEFAULT_HOME
-  call = triplet.call_a
-  snr = int(report.snr)
-  reasons: list[str] = []
-
-  if snr < config.min_snr:
-    return None
-  if snr > config.max_snr:
-    return None
-  if worked and config.skip_worked_today:
-    return None
-  dist = distance_km
-  if config.min_distance_km > 0 and (dist is None or dist < config.min_distance_km):
-    return None
-
-  score = 0.0
-  mode = config.priority
-
-  if mode == PriorityMode.DISTANCE:
-    score = float(dist or 0)
-    reasons.append(f"táv {dist or '?'} km")
-  elif mode == PriorityMode.WEAK_DX:
-    weak = max(0.0, -float(snr))
-    score = weak * 80.0 + float(dist or 0) * 0.8
-    if dist and dist > 2000:
-      score += 400
-      reasons.append("táv DX")
-    if snr < -10:
-      reasons.append(f"gyenge SNR {snr:+d}")
-  elif mode == PriorityMode.STRONG_FAST:
-    score = float(snr) * 15.0
-    reasons.append("erős = gyors QSO")
-  else:
-    score = float(dist or 250) * 0.4
-    if config.prefer_weak_bonus and snr < 0:
-      score += (-snr) * 12.0
-      reasons.append("gyenge→messzi?")
-    if snr > 0:
-      score -= snr * 6.0
-    if grid:
-      score += 80.0
-
-  if not reasons:
-    reasons.append("bejövő")
-
-  return CqCandidate(
-    call=call,
-    grid=grid4_upper(grid) if grid else "",
-    audio_hz=float(report.audio_hz),
-    snr=snr,
-    distance_km=dist,
-    score=score,
-    message=report.message,
-    reason=", ".join(reasons),
-    cycle=report.cycle,
+  return _score_candidate_core(
+    call=triplet.call_a,
+    report=report,
+    grid=grid,
+    distance_km=distance_km,
+    worked=worked,
+    config=config,
+    home=home,
+    is_cq=False,
   )
 
 

@@ -11,7 +11,7 @@ from PyFT8.receiver import AudioIn
 
 from cw_discover.ft8.audio_feed import Ft8AudioFeed
 from cw_discover.ft8.decode_meta import dsp_from_candidate, message_upper, time_iso_utc
-from cw_discover.ft8.ft8_protocol import snr_report_text
+from cw_discover.ft8.ft8_protocol import normalize_directed_call_order, snr_report_text
 from cw_discover.ft8.receiver_instrumented import InstrumentedReceiver
 
 DEFAULT_LINEIN = "alsa_input.pci-0000_00_1f.3.analog-stereo"
@@ -65,6 +65,8 @@ class Ft8Engine:
     on_levels: callable | None = None,
     on_candidate: callable | None = None,
     on_cycle_search: callable | None = None,
+    my_callsign: str = "",
+    my_grid4: str = "",
   ) -> None:
     self.dial_mhz = dial_mhz
     self._dial_hz = dial_mhz * 1_000_000
@@ -74,6 +76,8 @@ class Ft8Engine:
     self._on_levels = on_levels
     self._on_candidate = on_candidate
     self._on_cycle_search = on_cycle_search
+    self._my_callsign = my_callsign.strip().upper()
+    self._my_grid4 = my_grid4.strip().upper()[:4]
     self._seen: OrderedDict[str, None] = OrderedDict()
     self._lock = threading.Lock()
     self._audio_snap = AudioSnapshot()
@@ -114,6 +118,8 @@ class Ft8Engine:
     if not cycle:
       return
     msg = candidate.msg.strip()
+    if self._my_callsign:
+      msg = normalize_directed_call_order(msg, self._my_callsign, my_grid4=self._my_grid4)
     msg_norm = message_upper(msg)
     key = f"{cycle}|{msg_norm}"
     with self._lock:
@@ -153,6 +159,10 @@ class Ft8Engine:
       return
     self.feed.stop()
     self.running = False
+
+  def set_station_identity(self, callsign: str, grid4: str = "") -> None:
+    self._my_callsign = callsign.strip().upper()
+    self._my_grid4 = grid4.strip().upper()[:4]
 
   def set_dial_mhz(self, mhz: float) -> None:
     self.dial_mhz = mhz

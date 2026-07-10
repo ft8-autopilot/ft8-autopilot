@@ -54,22 +54,39 @@ class Esp32Ptt:
 
   def _cmd_unlocked(self, line: str, wait: float = 0.25) -> list[str]:
     """Soros parancs — a hívó már tartja a self._lock-ot (close/shutdown)."""
-    try:
-      ser = self._open()
-      ser.reset_input_buffer()
-      ser.write((line.strip() + "\n").encode())
-      ser.flush()
-      time.sleep(wait)
-      out: list[str] = []
-      while ser.in_waiting:
-        out.append(ser.readline().decode(errors="replace").strip())
-      for ln in out:
-        if "WARN PTT_STUCK" in ln:
-          self.last_error = ln
-      return out
-    except Exception as exc:
-      self.last_error = f"{line}: {exc}"
+    last_exc: Exception | None = None
+    had_serial_error = False
+    for _ in range(2):
+      try:
+        ser = self._open()
+        ser.reset_input_buffer()
+        ser.write((line.strip() + "\n").encode())
+        ser.flush()
+        time.sleep(wait)
+        out: list[str] = []
+        while ser.in_waiting:
+          out.append(ser.readline().decode(errors="replace").strip())
+        for ln in out:
+          if "WARN PTT_STUCK" in ln:
+            self.last_error = ln
+        return out
+      except Exception as exc:
+        last_exc = exc
+        had_serial_error = True
+        if self._ser is not None:
+          try:
+            self._ser.close()
+          except Exception:
+            pass
+          self._ser = None
+        time.sleep(0.05)
+    if had_serial_error and last_exc is not None:
+      self.last_error = (
+        f"{line} @ {self.port} serial_error="
+        f"{last_exc.__class__.__name__}: {last_exc}"
+      )
       return []
+    return []
 
   def _cmd(self, line: str, wait: float = 0.25) -> list[str]:
     with self._lock:
@@ -79,7 +96,7 @@ class Esp32Ptt:
     lines = self._cmd("PING")
     ok = any("PONG" in ln for ln in lines)
     if not ok:
-      self.last_error = f"PING nincs PONG: {lines!r}"
+      self.last_error = f"PING @ {self.port} nincs PONG: {lines!r}"
     return ok
 
   def status(self) -> dict[str, int | bool]:

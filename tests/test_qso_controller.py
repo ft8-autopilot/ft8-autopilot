@@ -501,14 +501,37 @@ def test_outbound_fail_cooldown_blocks_cq_not_incoming(tmp_path) -> None:
   assert h.phase == QsoPhase.IDLE
   assert h.op._is_outbound_cooldown("IK4LZH")
 
+  tx_before = len(h.tx.messages())
   h.feed("CQ IK4LZH JN54", hz=397, wait=False)
   assert h.op._active is None
-  assert len(h.tx.messages()) == 1
+  assert len(h.tx.messages()) == tx_before
 
   h.feed("IK4LZH N0CALL JN54", hz=397)
   assert h.op._active is not None
   assert h.op._active.remote_call == "IK4LZH"
-  assert len(h.tx.messages()) == 2
+  assert len(h.tx.messages()) == tx_before + 1
+
+
+def test_manual_engage_bypasses_outbound_cooldown(tmp_path) -> None:
+  """Kézi engage_call felülírja az outbound cooldown-t (dupla katt / CALL parancs)."""
+  from unittest.mock import patch
+
+  from cw_discover.ft8.sim_harness import Ft8SimHarness
+
+  h = Ft8SimHarness(tmp_dir=tmp_path)
+  h.feed("CQ IK4LZH JN54", hz=397)
+  tx_p = h.op._active.tx_period
+  with patch("cw_discover.ft8.qso_controller.ft8_period_at", return_value=tx_p):
+    for i in range(4):
+      h.tick_cycle(f"abandon{i}")
+  assert h.op._is_outbound_cooldown("IK4LZH")
+
+  tx_before = len(h.tx.messages())
+  h.op.engage_call("IK4LZH", 397.0, manual=True)
+  assert h.op._active is not None
+  assert h.op._active.remote_call == "IK4LZH"
+  h.wait_tx(tx_before + 1)
+  assert len(h.tx.messages()) == tx_before + 1
 
 
 def test_outbound_fail_cooldown_expires(tmp_path) -> None:
@@ -534,3 +557,114 @@ def test_outbound_fail_cooldown_expires(tmp_path) -> None:
     assert not h.op._is_outbound_cooldown("IK4LZH")
     h.feed("CQ IK4LZH JN54", hz=397)
     assert h.op._active.remote_call == "IK4LZH"
+
+
+def test_active_partner_reversed_report_handled_first(tmp_path) -> None:
+  """Fordított partner report (N0CALL IK4LZH R-05) — aktív QSO folytatás, nem preempt."""
+  from cw_discover.ft8.sim_harness import Ft8SimHarness
+
+  h = Ft8SimHarness(tmp_dir=tmp_path)
+  h.feed("CQ IK4LZH JN54", hz=397)
+  h.op._active.cycles_without_reply = 2
+  h.feed("N0CALL IK4LZH -15", cycle=h._fresh_cycle(), hz=397, wait=False)
+  assert h.op._active.remote_call == "IK4LZH"
+  assert h.op._active.rst_rcvd == "-15"
+  h.wait_tx(2, timeout=0.5)
+  assert h.tx.messages()[-1] == "IK4LZH N0CALL R-10"
+
+
+def test_reversed_preempt_during_stuck_active(tmp_path) -> None:
+  """Line-in fordított sorrend: N0CALL DK7ZT … — PRO váltás beragadt QSO-n."""
+  from cw_discover.ft8.pro_operator import ProOperatorConfig
+  from cw_discover.ft8.sim_harness import Ft8SimHarness
+
+  h = Ft8SimHarness(tmp_dir=tmp_path, pro=ProOperatorConfig(enabled=True, defer_cq_pick=False))
+  c = h.make_cycles(h._fresh_cycle(), 3)
+  h.feed("CQ IK4LZH JN54", cycle=c[0], hz=397)
+  h.op._active.cycles_without_reply = 2
+  h.feed("N0CALL DK7ZT JO30", cycle=c[1], snr=-8, hz=1867)
+  assert h.op._active.remote_call == "DK7ZT"
+
+
+def test_balanced_preempt_blocked_by_snr_margin(tmp_path) -> None:
+  """Kiegyensúlyozott: gyengébb bejövő nem preempt-el beragadt QSO-t."""
+  from cw_discover.ft8.pro_operator import PriorityMode, ProOperatorConfig
+  from cw_discover.ft8.sim_harness import Ft8SimHarness
+
+  pro = ProOperatorConfig(
+    enabled=True,
+    priority=PriorityMode.BALANCED,
+    defer_cq_pick=False,
+    preempt_snr_margin_db=3.0,
+    min_snr=-25,
+    max_snr=15,
+  )
+  h = Ft8SimHarness(tmp_dir=tmp_path, pro=pro)
+  c = h.make_cycles(h._fresh_cycle(), 4)
+  h.feed("CQ IK4LZH JN54", cycle=c[0], snr=-8, hz=397)
+  h.op._active.cycles_without_reply = 2
+  h.op._intel.last_snr["IK4LZH"] = -8
+  h.feed("DK7ZT N0CALL JO30", cycle=c[1], snr=-15, hz=1867, wait=False)
+  assert h.op._active.remote_call == "IK4LZH"
+  assert len(h.op._incoming_buffer) == 1
+  assert h.op._incoming_buffer[0].call == "DK7ZT"
+
+
+def test_strong_fast_max_retry_two(tmp_path) -> None:
+  """Gyors profil: max 2 retry ciklus, majd feladás."""
+  from unittest.mock import patch
+
+  from cw_discover.ft8.pro_operator import PriorityMode, ProOperatorConfig
+  from cw_discover.ft8.sim_harness import Ft8SimHarness
+
+  pro = ProOperatorConfig(enabled=True, priority=PriorityMode.STRONG_FAST, defer_cq_pick=False)
+  h = Ft8SimHarness(tmp_dir=tmp_path, pro=pro)
+  h.feed("CQ IK4LZH JN54", hz=397)
+  assert h.op._max_retry_cycles() == 2
+  tx_p = h.op._active.tx_period
+  with patch("cw_discover.ft8.qso_controller.ft8_period_at", return_value=tx_p):
+    for i in range(3):
+      h.tick_cycle(f"sf_abandon{i}")
+  assert h.phase == QsoPhase.IDLE
+  assert h.op._active is None
+
+
+def test_abandon_prefers_incoming_buffer_balanced(tmp_path) -> None:
+  """Feladás után kiegyensúlyozott: bejövő buffer előbb mint új CQ."""
+  from unittest.mock import patch
+
+  from cw_discover.ft8.pro_operator import CqCandidate, PriorityMode, ProOperatorConfig
+  from cw_discover.ft8.sim_harness import Ft8SimHarness
+
+  pro = ProOperatorConfig(enabled=True, priority=PriorityMode.BALANCED, defer_cq_pick=False)
+  h = Ft8SimHarness(tmp_dir=tmp_path, pro=pro)
+  h.feed("CQ IK4LZH JN54", hz=397)
+  cyc = h._fresh_cycle()
+  h.op._incoming_buffer.append(
+    CqCandidate(
+      call="DK7ZT",
+      grid="JO30",
+      audio_hz=1867.0,
+      snr=-10,
+      distance_km=500.0,
+      score=100.0,
+      message="DK7ZT N0CALL JO30",
+      reason="buffered",
+      cycle=cyc,
+    )
+  )
+  tx_p = h.op._active.tx_period
+  with patch("cw_discover.ft8.qso_controller.ft8_period_at", return_value=tx_p):
+    for i in range(4):
+      h.tick_cycle(f"bal_abandon{i}")
+  assert h.op._active is not None
+  assert h.op._active.remote_call == "DK7ZT"
+
+
+def test_strong_fast_shorter_outbound_cooldown(tmp_path) -> None:
+  from cw_discover.ft8.pro_operator import PriorityMode, ProOperatorConfig
+  from cw_discover.ft8.sim_harness import Ft8SimHarness
+
+  pro = ProOperatorConfig(enabled=True, priority=PriorityMode.STRONG_FAST)
+  h = Ft8SimHarness(tmp_dir=tmp_path, pro=pro)
+  assert h.op._outbound_cooldown_sec() == 180

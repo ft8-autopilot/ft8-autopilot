@@ -53,6 +53,7 @@ class Ft8TxPlayer:
     simulate: bool = False,
     on_state: Callable[[bool, str, str], None] | None = None,
     line_guard: LineOutGuard | None = None,
+    line_in_guard: Callable[[], bool] | None = None,
   ) -> None:
     self.ptt = ptt or NullPtt()
     self.audio_device = audio_device
@@ -60,6 +61,7 @@ class Ft8TxPlayer:
     self.simulate = simulate
     self.on_state = on_state
     self._line_guard = line_guard
+    self._line_in_guard = line_in_guard
     self._ao = AudioOut()
     self._lock = threading.Lock()
     self._line_out_ready = False
@@ -174,8 +176,10 @@ class Ft8TxPlayer:
   ) -> bool:
     """True = teljes lejátszás, False = megszakítva (sd.stop / should_abort)."""
     duration = len(stereo) / FS
+    min_ok = duration * 0.92
+    started = time.monotonic()
     sd.play(stereo, FS, device=self.audio_device, blocking=False)
-    end_at = time.monotonic() + duration + 0.35
+    end_at = started + duration + 0.35
     while time.monotonic() < end_at:
       if should_abort is not None and should_abort():
         self.halt_audio()
@@ -183,12 +187,18 @@ class Ft8TxPlayer:
       try:
         stream = sd.get_stream()
         if stream is None or not stream.active:
-          return True
+          if time.monotonic() - started >= min_ok:
+            return True
+          self.halt_audio()
+          return False
       except Exception:
-        return True
+        if time.monotonic() - started >= min_ok:
+          return True
+        self.halt_audio()
+        return False
       time.sleep(0.02)
     self.halt_audio()
-    return False
+    return True
 
   def transmit(
     self,
@@ -198,6 +208,10 @@ class Ft8TxPlayer:
     tx_period: int | None = None,
     should_abort: Callable[[], bool] | None = None,
   ) -> TxResult:
+    if self._line_in_guard is not None and not self._line_in_guard():
+      self._log_tx("TX_BLOCK", message, "line_in_low")
+      return TxResult(message=message, audio_hz=audio_hz, ok=False, error="line_in_blocked")
+
     if self.simulate:
       with self._lock:
         if should_abort is not None and should_abort():
@@ -228,8 +242,10 @@ class Ft8TxPlayer:
         return TxResult(message=message, audio_hz=audio_hz, ok=False, error=ptt_err)
       stereo = self._mono_to_stereo(wave)
       with self._pulse_sink_env():
-        if not self._play_interruptible(stereo, should_abort=should_abort):
+        if should_abort is not None and should_abort():
           aborted = True
+        else:
+          sd.play(stereo, FS, device=self.audio_device, blocking=True)
     except Exception as exc:
       self._log_tx("AUDIO_FAIL", message, str(exc))
       return TxResult(message=message, audio_hz=audio_hz, ok=False, error=str(exc))

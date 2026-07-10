@@ -94,6 +94,12 @@ class RecordingTx:
     self.calls.append((message, audio_hz, tx_period))
     return TxResult(message=message, audio_hz=audio_hz, ok=True)
 
+  def halt_audio(self) -> None:
+    pass
+
+  def force_ptt_off(self) -> None:
+    pass
+
 
 def _make_op(tmp_path, *, pro: bool = False, defer_cq: bool = False) -> tuple[Ft8AutoOperator, RecordingTx]:
   pro_cfg = ProOperatorConfig(enabled=pro, defer_cq_pick=defer_cq, min_snr=-20, max_snr=5)

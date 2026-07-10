@@ -13,7 +13,7 @@ class ErrorSpec:
 
 
 CATALOG: dict[str, ErrorSpec] = {
-  # --- ESP32 / PTT / soros (7) ---
+  # --- ESP32 / PTT / soros (10) ---
   "esp_safety_lock": ErrorSpec(
     "esp_safety_lock",
     "ESP32",
@@ -61,6 +61,24 @@ CATALOG: dict[str, ErrorSpec] = {
     "ESP32",
     "USB / soros kapcsolat megszakadt vagy nem elérhető",
     "CP2102 USB, kábel, port foglaltság; zárd be a másik programot a porton",
+  ),
+  "esp_usb_disconnected": ErrorSpec(
+    "esp_usb_disconnected",
+    "ESP32",
+    "ESP32 USB kapcsolat megszakadt (kihúzás / eszköz eltűnt)",
+    "Ellenőrizd a kábelt és a CP2102 portot; visszadugás után auto-helyreállítás indul",
+  ),
+  "esp_usb_recover_try": ErrorSpec(
+    "esp_usb_recover_try",
+    "ESP32",
+    "ESP32 auto-helyreállítás próbálkozás fut",
+    "Várj 1-2 ciklust; ha nem áll vissza, ellenőrizd az USB eszközt és a portot",
+  ),
+  "esp_usb_recovered": ErrorSpec(
+    "esp_usb_recovered",
+    "ESP32",
+    "ESP32 USB kapcsolat automatikusan helyreállt",
+    "Nincs teendő; a TX automata folytatható",
   ),
   # --- Biztonság (4) ---
   "safety_trip_stuck_ptt": ErrorSpec(
@@ -155,6 +173,18 @@ CATALOG: dict[str, ErrorSpec] = {
     "RX",
     "Line-in port beállítása sikertelen",
     "Hangkártya menü → válaszd a line-in bemenetet; pactl set-source-port",
+  ),
+  "rx_linein_low": ErrorSpec(
+    "rx_linein_low",
+    "RX",
+    "Line-in jelszint alacsony vagy hiányzik",
+    "Ellenőrizd a kábelt, a rádió AF kimenetét és a line-in csatlakozást; TX tiltva",
+  ),
+  "rx_linein_restored": ErrorSpec(
+    "rx_linein_restored",
+    "RX",
+    "Line-in jelszint rendben — TX újra engedélyezve",
+    "",
   ),
   # --- Rendszer (2) ---
   "system_port_busy": ErrorSpec(

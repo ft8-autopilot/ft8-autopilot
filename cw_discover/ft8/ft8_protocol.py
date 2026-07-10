@@ -7,13 +7,14 @@ from functools import lru_cache
 
 from cw_discover.ft8.callsign import CQ_MODIFIERS, is_callsign, is_cq_modifier, valid_remote_call
 from cw_discover.ft8.decode_meta import _message_upper_cached, message_stripped
-from cw_discover.ft8.grid_geo import GRID4_RE, REPORT_RE
+from cw_discover.ft8.grid_geo import GRID4_RE, REPORT_RE, grid4_upper
 
 # Kompatibilitás — régi importok
 __all__ = [
   "CQ_MODIFIERS",
   "MessageTriplet",
   "message_triplet",
+  "normalize_directed_call_order",
   "is_report",
   "is_r_report",
   "is_rrr",
@@ -57,6 +58,38 @@ def _message_triplet_cached(message: str) -> MessageTriplet | None:
   if len(parts) >= 3:
     return MessageTriplet(parts[0], parts[1], parts[2])
   return None
+
+
+def normalize_directed_call_order(
+  message: str,
+  me: str,
+  *,
+  my_grid4: str = "",
+) -> str:
+  """
+  PyFT8/line-in fordított call sorrend javítása: N0CALL REMOTE … → REMOTE N0CALL …
+
+  Csak irányított QSO üzenetek (grid/report/73) — CQ és már helyes sorrend érintetlen.
+  """
+  me = me.strip().upper()
+  if not me:
+    return message_stripped(message)
+  triplet = message_triplet(message)
+  if triplet is None or triplet.is_cq:
+    return message_stripped(message)
+  if triplet.call_b == me:
+    return message_stripped(message)
+  if triplet.call_a != me or not valid_remote_call(triplet.call_b):
+    return message_stripped(message)
+  third = triplet.third
+  g4 = grid4_upper(my_grid4) if my_grid4 else ""
+  if g4 and is_grid_token(third) and grid4_upper(third) == g4:
+    return message_stripped(message)
+  if is_report(third) or is_r_report(third) or is_grid_token(third):
+    return f"{triplet.call_b} {me} {third}"
+  if is_rr73(third) or is_73(third) or is_rrr(third):
+    return f"{triplet.call_b} {me} {third}"
+  return message_stripped(message)
 
 
 def is_report(token: str) -> bool:

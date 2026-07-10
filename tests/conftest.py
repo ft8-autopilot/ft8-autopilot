@@ -32,5 +32,17 @@ settings.load_profile("default")
 
 
 def pytest_configure(config):
+  import os
+  from pathlib import Path
+
+  # Tesztek ne írjanak az élő operator_decisions.jsonl-be.
+  if not os.environ.get("FT8_OPERATOR_DECISIONS"):
+    test_log = Path(__file__).resolve().parent / ".operator_decisions_test.jsonl"
+    os.environ["FT8_OPERATOR_DECISIONS"] = str(test_log)
+    # Új modul-import előtt állítjuk — reload szükséges ha már importálva volt.
+    import cw_discover.ft8.operator_decisions as od
+
+    od._DECISION_LOG = test_log
+
   config.addinivalue_line("markers", "hypothesis_stress: nagy max_examples fuzz (lassú)")
   config.addinivalue_line("markers", "integration: élő folyamat / I/O integrációs teszt")

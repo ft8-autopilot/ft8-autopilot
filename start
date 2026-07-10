@@ -1,0 +1,125 @@
+#!/bin/bash
+# FT8 automata üzem — indítás / leállítás / állapot (cw-discover-opt)
+# Használat: ./start          → indítás
+#           ./start stop       → leállítás
+#           ./start restart    → újraindítás
+#           ./start status     → fut-e, rövid összegzés
+#           ./start help       → súgó
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+LIVE="$ROOT/forgalminaplo/live"
+VENV_PY="$ROOT/.venv/bin/python"
+START_SCRIPT="$ROOT/scripts/start_auto_ft8.sh"
+
+usage() {
+  cat <<'EOF'
+FT8 vezérlő — cw-discover-opt
+
+  ./start              Teljes automata üzem indítása (GUI + bridge + felügyelet)
+  ./start stop         Minden FT8 folyamat leállítása
+  ./start restart      Leállítás, majd újraindítás
+  ./start status       Futó folyamatok + élő állapot (gui_status.json)
+  ./start help         Ez a súgó
+
+Részletes parancsok (internet nélkül is): start.txt
+EOF
+}
+
+is_running() {
+  pgrep -f "run_ft8_gui.py" >/dev/null 2>&1 \
+    || pgrep -f "ft8_live_bridge.py" >/dev/null 2>&1 \
+    || pgrep -f "auto_ft8_watch.py" >/dev/null 2>&1
+}
+
+do_stop() {
+  echo "FT8 leállítás..."
+  pkill -f run_ft8_gui.py 2>/dev/null || true
+  pkill -f ft8_live_bridge.py 2>/dev/null || true
+  pkill -f auto_ft8_watch.py 2>/dev/null || true
+  sleep 1
+  if is_running; then
+    echo "Figyelem: még fut valami — nézd: ./start status"
+    return 1
+  fi
+  echo "Leállítva."
+}
+
+do_status() {
+  echo "=== Folyamatok ==="
+  for name in run_ft8_gui.py ft8_live_bridge.py auto_ft8_watch.py; do
+    if pgrep -af "$name" 2>/dev/null | grep -v "pgrep -af" | head -1; then
+      :
+    else
+      echo "  (nincs) $name"
+    fi
+  done
+  echo ""
+  echo "=== Élő állapot (gui_status.json) ==="
+  if [[ -f "$LIVE/gui_status.json" ]]; then
+    "$VENV_PY" - <<PY
+import json
+from pathlib import Path
+p = Path("$LIVE/gui_status.json")
+d = json.loads(p.read_text(encoding="utf-8"))
+hh = d.get("hardware_health") or {}
+print(f"  Idő (UTC):     {d.get('time_utc', '?')}")
+print(f"  Sáv / dial:    {d.get('band', '?')} @ {d.get('dial_mhz', '?')} MHz")
+print(f"  RX fut:        {d.get('rx_running')}")
+print(f"  PTT armolva:   {d.get('ptt_armed')}")
+print(f"  PRO operátor:  {d.get('pro_operator')}")
+print(f"  QSO fázis:     {d.get('qso_phase')}  partner={d.get('qso_partner') or '-'}")
+print(f"  ESP / PTT OK:  {d.get('ptt_serial_ok')}  MCU aktív: {d.get('safety_mcu_active')}")
+print(f"  Line-in OK:    {d.get('line_in_ok')}  RMS={d.get('line_in_rms')}")
+print(f"  Dekódok:       {d.get('decode_count', 0)}")
+if d.get("last_tx_error"):
+    print(f"  Utolsó TX hiba: {d.get('last_tx_error')}")
+issues = hh.get("issues") or []
+if issues:
+    print(f"  Hardver issues: {', '.join(issues)}")
+else:
+    print(f"  TX kész:       {hh.get('tx_ready', '?')}")
+PY
+  else
+    echo "  (nincs gui_status.json — a GUI még nem indult vagy nem ír állapotot)"
+  fi
+}
+
+do_start() {
+  if [[ ! -x "$VENV_PY" ]]; then
+    echo "Hiba: nincs .venv — telepítés szükséges." >&2
+    exit 1
+  fi
+  if [[ ! -f "$START_SCRIPT" ]]; then
+    echo "Hiba: hiányzik $START_SCRIPT" >&2
+    exit 1
+  fi
+  bash "$START_SCRIPT"
+}
+
+cmd="${1:-start}"
+case "$cmd" in
+  start)
+    do_start
+    ;;
+  stop)
+    do_stop
+    ;;
+  restart)
+    do_stop || true
+    sleep 1
+    do_start
+    ;;
+  status|stat)
+    do_status
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Ismeretlen parancs: $cmd" >&2
+    echo ""
+    usage
+    exit 1
+    ;;
+esac

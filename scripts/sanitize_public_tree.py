@@ -60,6 +60,9 @@ REPLACEMENTS = [
   ("siofok()", "default()"),
   ("HomeQth.siofok", "HomeQth.default"),
   ("HA3GX állomás tapasztalat", "operátori tapasztalat"),
+  ('Path("/home/home/ai/ne_50m/ne_50m_admin_0_countries.shp"),\n  ', ""),
+  ("cw-discover-opt", "ft8-autopilot"),
+  ("/home/home/ai/ft8-autopilot", "ft8-autopilot"),
 ]
 
 TEXT_SUFFIXES = {".py", ".md", ".sh", ".txt", ".json", ".example", ".c", ".h"}

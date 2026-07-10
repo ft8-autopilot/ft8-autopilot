@@ -1,4 +1,4 @@
-"""Projekt útvonalak — cw-discover-opt 2.0 gyökér alatt minden futásidejű adat."""
+"""Projekt útvonalak — ft8-autopilot 2.0 gyökér alatt minden futásidejű adat."""
 from __future__ import annotations
 
 from pathlib import Path

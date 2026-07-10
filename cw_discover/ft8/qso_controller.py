@@ -38,6 +38,7 @@ from cw_discover.ft8.ft8_slot import (
 from cw_discover.ft8.home_qth import DEFAULT_HOME, HOME_LAT, HOME_LON
 from cw_discover.ft8.pro_operator import (
   ContactIntelCache,
+  CqCandidate,
   PriorityMode,
   ProOperatorConfig,
   geo_distance_for_cq,
@@ -46,6 +47,7 @@ from cw_discover.ft8.pro_operator import (
   score_incoming_candidate,
 )
 from cw_discover.ft8.station_identity import StationIdentity
+from cw_discover.ft8.operator_decisions import log_operator_decision
 from cw_discover.ft8.tx_player import Ft8TxPlayer, snap_ft8_hz
 
 
@@ -81,7 +83,26 @@ class Ft8AutoOperator:
   """
 
   MAX_RETRY_CYCLES = 3
-  OUTBOUND_FAIL_COOLDOWN_SEC = 600  # sikertelen outbound → 10 perc CQ-vadászat off
+  OUTBOUND_FAIL_COOLDOWN_SEC = 600  # kiegyensúlyozott alap — strong_fast: 180
+
+  def _max_retry_cycles(self) -> int:
+    return self.station.pro.effective_max_retry_cycles()
+
+  def _outbound_cooldown_sec(self) -> int:
+    return self.station.pro.effective_outbound_cooldown_sec()
+
+  def _effective_defer_cq_pick(self) -> bool:
+    return self.station.pro.effective_defer_cq_pick()
+
+  def _log_decision(self, event: str, **fields: object) -> None:
+    pro = self.station.pro
+    log_operator_decision(
+      event,
+      phase=self._phase.value,
+      partner=self._active.remote_call if self._active else "",
+      pro_priority=pro.priority.value if pro.enabled else "",
+      **fields,
+    )
 
   def __init__(
     self,
@@ -161,10 +182,11 @@ class Ft8AutoOperator:
     self.tx.halt_audio()
     self.tx.force_ptt_off()
 
-  def halt_transmission(self, reason: str = "") -> None:
+  def halt_transmission(self, reason: str = "", *, keep_armed: bool = False) -> None:
     """Teljes TX leállítás — QSO közben is, várakozó sor és aktív adás."""
     with self._lock:
-      self.armed = False
+      if not keep_armed:
+        self.armed = False
       self._active = None
       self._phase = QsoPhase.IDLE
       self._cq_wait_remaining = 0
@@ -184,8 +206,9 @@ class Ft8AutoOperator:
     *,
     rx_report: str = "",
     rx_snr: int = 0,
+    manual: bool = False,
   ) -> None:
-    """Kényszerített QSO — pl. bejövő hívás PRO váltás."""
+    """Kényszerített QSO — pl. bejövő hívás PRO váltás vagy kézi táblázat-hívás."""
     call = _call_key(call)
     with self._lock:
       self._active = None
@@ -195,15 +218,16 @@ class Ft8AutoOperator:
     me = self._me_callsign
     grid = self._intel.grid_for(call)
     self._begin_qso(call, grid, audio_hz, heard_period=ft8_period_at())
+    label = "Kézi" if manual else "PRO"
     if rx_report and is_report(rx_report):
       self._active.rst_rcvd = rst_from_report_token(rx_report)
       rst = snr_report_text(rx_snr)
       self._active.rst_sent = rst
       self._queue_tx(f"{call} {me} R{rst}", audio_hz)
-      self._status(f"PRO → {call} (jelentés {rx_report})")
+      self._status(f"{label} → {call} (jelentés {rx_report})")
     else:
       self._queue_tx(f"{call} {me} {self._my_grid4}", audio_hz)
-      self._status(f"PRO → {call}")
+      self._status(f"{label} → {call}")
 
   @staticmethod
   def _directed_to_me(triplet: MessageTriplet, me: str) -> str | None:
@@ -213,9 +237,13 @@ class Ft8AutoOperator:
     return None
 
   def _accepts_reversed_incoming(self) -> bool:
-    """Fordított N0CALL REMOTE … — CQ üzemben (calling_cq vagy idle várakozás)."""
-    if self._active is not None or not self.armed:
+    """Fordított N0CALL REMOTE … — CQ üzem + beragadt aktív QSO (line-in)."""
+    if not self.armed:
       return False
+    if self._active is not None:
+      if self._phase != QsoPhase.ACTIVE or not self.station.pro.enabled:
+        return False
+      return self._stuck_active()
     if self._phase == QsoPhase.CALLING_CQ:
       return True
     return self._phase == QsoPhase.IDLE and self._cq_only_mode
@@ -284,14 +312,84 @@ class Ft8AutoOperator:
       return False
     return True
 
-  def _should_preempt_for_incoming(self, remote: str) -> bool:
+  def _stuck_active(self) -> bool:
+    if self._active is None:
+      return False
+    return self._active.cycles_without_reply >= 1 or not self._active.rst_rcvd
+
+  def _detect_incoming(self, triplet: MessageTriplet, me: str) -> str | None:
+    """Normál (REMOTE ME) vagy fordított (ME REMOTE) bejövő hívás."""
+    incoming = self._directed_to_me(triplet, me)
+    if incoming is None:
+      incoming = self._directed_to_me_reversed(triplet, me)
+    return incoming
+
+  def _buffer_incoming_candidate(
+    self,
+    cand: CqCandidate,
+    incoming: str,
+    *,
+    stuck_partner: str = "",
+  ) -> None:
+    self._prune_incoming_buffer()
+    self._incoming_buffer.append(cand)
+    fields: dict[str, object] = {
+      "remote": incoming,
+      "score": round(cand.score, 1),
+      "snr": cand.snr,
+      "reason": cand.reason,
+    }
+    if stuck_partner:
+      fields["stuck_partner"] = stuck_partner
+    self._log_decision("incoming_buffered", **fields)
+    if stuck_partner:
+      self._status(
+        f"Beragadt QSO — bejövő buffer: {incoming} score={cand.score:.0f}"
+      )
+    else:
+      self._status(f"CQ üzem jelölt: {incoming} score={cand.score:.0f} ({cand.reason})")
+
+  def _abandon_stuck_qso(self, failed: str, *, cycles: int, max_retry: int) -> bool:
+    """Feladás — TX sor ürítés, opcionális bejövő buffer flush. True ha új QSO indult."""
+    self._status(f"Feladás: {failed} (nincs válasz)")
+    self._mark_outbound_failed(failed)
+    self._log_decision("abandon", remote=failed, cycles=cycles, max_retry=max_retry)
+    self._drain_tx_queue()
+    self._queued_slot_id = ""
+    self._active = None
+    self._phase = QsoPhase.IDLE
+    self._cq_wait_remaining = 0
+    pro = self.station.pro
+    if pro.enabled and pro.priority == PriorityMode.BALANCED:
+      return self._flush_incoming_buffer()
+    if self._cq_only_mode:
+      return self._flush_incoming_buffer()
+    return False
+
+  def _should_preempt_for_incoming(self, remote: str, incoming_snr: int = -999) -> bool:
     if self._active is None:
       return True
     if self._active.remote_call == remote:
       return False
     if not self.station.pro.enabled:
       return False
-    return self._active.cycles_without_reply >= 1 or not self._active.rst_rcvd
+    if not self._stuck_active():
+      return False
+    pro = self.station.pro
+    if pro.priority == PriorityMode.BALANCED:
+      stuck = _call_key(self._active.remote_call)
+      stuck_snr = self._intel.last_snr.get(stuck, -999)
+      margin = pro.preempt_snr_margin_db
+      if incoming_snr < stuck_snr - margin:
+        self._log_decision(
+          "preempt_blocked_snr",
+          incoming=remote,
+          incoming_snr=incoming_snr,
+          stuck_snr=stuck_snr,
+          margin_db=margin,
+        )
+        return False
+    return True
 
   def set_cq_wait_periods(self, periods: int) -> None:
     """CQ-k közötti várakozási periódusok (1, 3, 5, 7, 9)."""
@@ -332,7 +430,7 @@ class Ft8AutoOperator:
     if not cu:
       return
     with self._lock:
-      self._outbound_cooldown[cu] = time.monotonic() + self.OUTBOUND_FAIL_COOLDOWN_SEC
+      self._outbound_cooldown[cu] = time.monotonic() + self._outbound_cooldown_sec()
 
   def _clear_outbound_cooldown(self, call: str) -> None:
     with self._lock:
@@ -372,6 +470,7 @@ class Ft8AutoOperator:
     if not self.armed:
       return
     with self._lock:
+      had_active = self._active is not None
       flushed = False
       new_cycle = cycle != self._last_cycle_key
       if new_cycle:
@@ -383,11 +482,11 @@ class Ft8AutoOperator:
       slot = ft8_period_at()
       if self._active is not None:
         if slot == self._active.tx_period:
-          if flushed:
+          if flushed and not had_active:
             return
           if self._phase == QsoPhase.CLOSING:
             self._active.cycles_without_reply += 1
-            if self._active.cycles_without_reply > self.MAX_RETRY_CYCLES:
+            if self._active.cycles_without_reply > self._max_retry_cycles():
               self._status(f"Lezárás (nincs 73): {self._active.remote_call}")
               self._finish_qso()
               return
@@ -396,13 +495,12 @@ class Ft8AutoOperator:
               self._queue_tx(self._last_tx_msg, self._active.audio_hz, is_retry=True)
             return
           self._active.cycles_without_reply += 1
-          if self._active.cycles_without_reply > self.MAX_RETRY_CYCLES:
+          max_retry = self._max_retry_cycles()
+          if self._active.cycles_without_reply > max_retry:
             failed = self._active.remote_call
-            self._status(f"Feladás: {failed} (nincs válasz)")
-            self._mark_outbound_failed(failed)
-            self._active = None
-            self._phase = QsoPhase.IDLE
-            self._cq_wait_remaining = 0
+            cycles = self._active.cycles_without_reply
+            if self._abandon_stuck_qso(failed, cycles=cycles, max_retry=max_retry):
+              return
           elif self._last_tx_msg:
             self._queue_tx(self._last_tx_msg, self._active.audio_hz, is_retry=True)
         return
@@ -502,6 +600,59 @@ class Ft8AutoOperator:
       return
     self._default_tx_hz = snap_ft8_hz(hz)
 
+  def _try_incoming_preempt_or_buffer(
+    self,
+    triplet: MessageTriplet,
+    report: DecodeReport,
+    me: str,
+    incoming: str,
+    inc_snr: int,
+  ) -> bool:
+    """PRO váltás vagy beragadt QSO bejövő buffer. True ha kezelve."""
+    if self._should_preempt_for_incoming(incoming, inc_snr):
+      if self._active is not None and self._active.remote_call != incoming:
+        stuck = self._active.remote_call
+        self._log_decision(
+          "preempt",
+          from_remote=stuck,
+          to_remote=incoming,
+          incoming_snr=inc_snr,
+        )
+        self._status(f"PRO váltás → {incoming}")
+        self._active = None
+        self._phase = QsoPhase.IDLE
+      if self._active is None:
+        inc_triplet = self._incoming_triplet(triplet, me, incoming)
+        return self._process_incoming_call(inc_triplet, report, me, incoming)
+      return True
+
+    if (
+      self._active is not None
+      and incoming != self._active.remote_call
+      and self.station.pro.enabled
+      and self._stuck_active()
+    ):
+      inc_triplet = self._incoming_triplet(triplet, me, incoming)
+      third = inc_triplet.third
+      if is_rr73(third) or is_73(third) or is_report(third):
+        return False
+      worked = self.naplo.recently_worked(incoming, band=self.band)
+      grid, dist = self._resolve_grid_dist(report, incoming, third=third)
+      cand = score_incoming_candidate(
+        report=report,
+        triplet=inc_triplet,
+        grid=grid,
+        distance_km=dist,
+        worked=worked,
+        config=self.station.pro,
+      )
+      if cand is not None:
+        self._buffer_incoming_candidate(
+          cand, incoming, stuck_partner=self._active.remote_call
+        )
+        return True
+    return False
+
   def on_decode(self, report: DecodeReport) -> None:
     if not self.armed:
       return
@@ -514,20 +665,14 @@ class Ft8AutoOperator:
     self._maybe_adopt_cq_hz(report, triplet, me)
     if self._ignore_me_first_decode(triplet, me):
       return
-    incoming = self._directed_to_me(triplet, me)
-    if incoming is None:
-      incoming = self._directed_to_me_reversed(triplet, me)
     with self._lock:
-      if incoming and self._should_preempt_for_incoming(incoming):
-        if self._active is not None and self._active.remote_call != incoming:
-          self._status(f"PRO váltás → {incoming}")
-          self._active = None
-          self._phase = QsoPhase.IDLE
-        if self._active is None:
-          inc_triplet = self._incoming_triplet(triplet, me, incoming)
-          if self._process_incoming_call(inc_triplet, report, me, incoming):
-            return
+      # Aktív partner üzenete előbb — ne keveredjen bejövő/preempt útvonalba (fordított sorrend).
       if self._active is not None and self._handle_active_exchange(triplet, report, me):
+        return
+      incoming = self._detect_incoming(triplet, me)
+      if incoming and self._try_incoming_preempt_or_buffer(
+        triplet, report, me, incoming, int(report.snr)
+      ):
         return
       if triplet.is_cq:
         self._maybe_answer_cq(triplet, report)
@@ -572,9 +717,7 @@ class Ft8AutoOperator:
         config=self.station.pro,
       )
       if cand is not None:
-        self._prune_incoming_buffer()
-        self._incoming_buffer.append(cand)
-        self._status(f"CQ üzem jelölt: {incoming} score={cand.score:.0f} ({cand.reason})")
+        self._buffer_incoming_candidate(cand, incoming)
       return True
 
     g4 = grid4_upper(grid or triplet.third)
@@ -617,7 +760,7 @@ class Ft8AutoOperator:
     grid, dist = self._resolve_grid_dist(report, call, third=third)
     self._note_intel(call, grid, report.snr, dist)
 
-    if pro.enabled and pro.defer_cq_pick:
+    if pro.enabled and self._effective_defer_cq_pick():
       cand = score_cq_candidate(
         report=report,
         triplet=triplet,
@@ -637,6 +780,7 @@ class Ft8AutoOperator:
   def _answer_cq(self, call: str, grid: str, audio_hz: float, reason: str, snr: int, *, cycle: str = "") -> None:
     if self._is_outbound_cooldown(call):
       return
+    self._log_decision("cq_pick", remote=call, reason=reason, snr=snr)
     heard = period_from_cycle(cycle) if cycle else ft8_period_at()
     self._begin_qso(call, grid, audio_hz, heard_period=heard)
     self._default_tx_hz = audio_hz
@@ -663,6 +807,13 @@ class Ft8AutoOperator:
     skip_our_grid: bool = False,
     reason: str = "",
   ) -> None:
+    self._log_decision(
+      "incoming_pick",
+      remote=call,
+      snr=snr,
+      reason=reason or ("report" if rx_report else "grid"),
+      skip_our_grid=skip_our_grid,
+    )
     heard = period_from_cycle(cycle) if cycle else ft8_period_at()
     self._begin_qso(call, grid, audio_hz, heard_period=heard)
     self._default_tx_hz = audio_hz

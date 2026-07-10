@@ -4,6 +4,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -12,13 +13,30 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from cw_discover.audio.pulse_sources import list_pulse_sources
 from cw_discover.ft8.audio_feed import set_line_in_port
+from cw_discover.ft8.decode_inject import parse_inject_decode_command
 from cw_discover.ft8.engine import DecodeReport, Ft8Engine, DEFAULT_LINEIN
-from cw_discover.ft8.json_fast import dumps_compact
-from cw_discover.ft8.decode_meta import message_preamble, message_preamble_geo, message_upper, time_hms_utc, time_iso_utc
+from cw_discover.ft8.esp_resume import try_resume_esp
+from cw_discover.ft8.line_in_level_tracker import LineInLevelTracker
+from cw_discover.ft8.line_in_monitor import LINE_IN_MIN_RMS, LineInMonitor
+from cw_discover.gui.controllers.line_in import LineInEventKind, LineInStateController
+from cw_discover.gui.controllers.safety import apply_reactivate_plan, plan_esp_unlock_reactivate, plan_reactivate_all
+from cw_discover.ft8.decode_meta import message_preamble, message_preamble_geo, message_upper, time_hms_utc
 from cw_discover.ft8.grid_geo import _call_key, extract_callsigns_from_message, lookup as grid_lookup
 from cw_discover.ft8.home_qth import DEFAULT_HOME, HomeQth
 from cw_discover.ft8.pro_operator import PriorityMode
 from cw_discover.ft8.ptt_client import Esp32Ptt, make_ptt
+from cw_discover.ft8.rx_stall_guard import RxStallGuard
+from cw_discover.gui.controllers.esp_link import EspLinkController, EspLinkEventKind
+from cw_discover.gui.controllers.operator_in import (
+  OperatorCmdKind,
+  OperatorCommand,
+  parse_operator_batch,
+  parse_operator_line,
+  parse_priority_mode,
+)
+from cw_discover.gui.controllers.operator_in_reader import OperatorInReader
+from cw_discover.gui.controllers.table_engage import parse_table_engage
+from cw_discover.gui.live_status import GuiLiveSnapshot, LiveStatusPublisher
 from cw_discover.ft8.qso_controller import Ft8AutoOperator, QsoPhase
 from cw_discover.ft8.safety_manager import (
   load_safety_state,
@@ -30,6 +48,7 @@ from cw_discover.ft8.safety_manager import (
 from cw_discover.ft8.session_log import LOG_DIR, SessionLog
 from cw_discover.ft8.station_identity import CQ_WAIT_PERIOD_CHOICES, StationIdentity
 from cw_discover.ft8.tx_player import Ft8TxPlayer
+from cw_discover.ft8.tx_log_repair import repair_tx_log
 from cw_discover.ft8.tx_safety import LineOutGuard, wrap_ptt_with_watchdog
 from cw_discover.ft8.log_search import today_log_day
 from cw_discover.gui.log_search_dialog import LogSearchDialog
@@ -42,50 +61,17 @@ from cw_discover.gui.error_journal import (
 )
 from cw_discover.gui.error_log_dialog import ErrorLogDialog
 from cw_discover.gui.error_catalog import ALL_CODES
+from cw_discover.gui.widgets.alert_styles import esp_alert_stylesheet, linein_alert_stylesheet, tx_indicator_stylesheet
+from cw_discover.gui.widgets.level_meter import LevelMeter
 from cw_discover.gui.world_map_widget import WorldMapWidget
 
 from cw_discover.paths import ERROR_JOURNAL, FORGALMI_LIVE, STATION_FILE
 OPERATOR_IN = FORGALMI_LIVE / "operator_in.txt"
 GUI_LIVE_STATUS = FORGALMI_LIVE / "gui_status.json"
 
-
-class LevelMeter(QtWidgets.QWidget):
-  def __init__(self, title: str, color: str, parent=None) -> None:
-    super().__init__(parent)
-    self._title = title
-    self._color = QtGui.QColor(color)
-    self._rms = 0.0
-    self._peak = 0.0
-    self._clip = 0.0
-    self.setMinimumHeight(64)
-
-  def set_values(self, rms: float, peak: float, clip: float) -> None:
-    self._rms = rms
-    self._peak = peak
-    self._clip = clip
-    self.update()
-
-  def paintEvent(self, _event) -> None:
-    p = QtGui.QPainter(self)
-    w, h = self.width(), self.height()
-    p.fillRect(0, 0, w, h, QtGui.QColor("#161b22"))
-    p.setPen(QtGui.QColor("#8b949e"))
-    p.drawText(8, 14, self._title)
-    bar_y, bar_h = 20, h - 34
-    p.setBrush(QtGui.QColor("#21262d"))
-    p.setPen(QtCore.Qt.NoPen)
-    p.drawRoundedRect(8, bar_y, w - 16, bar_h, 3, 3)
-    db = 20.0 * np.log10(max(self._rms, 1e-8))
-    frac = float(np.clip((db + 50.0) / 50.0, 0.0, 1.0))
-    col = QtGui.QColor("#f85149") if self._clip > 0.01 else self._color
-    fill_w = int((w - 16) * frac)
-    if fill_w > 0:
-      p.setBrush(col)
-      p.drawRoundedRect(8, bar_y, fill_w, bar_h, 3, 3)
-    p.setPen(QtGui.QColor("#c9d1d9"))
-    clip_txt = f" CLIP {100*self._clip:.0f}%" if self._clip > 0.005 else ""
-    p.drawText(8, h - 8, f"RMS {self._rms:.4f}  peak {self._peak:.3f}{clip_txt}")
-    p.end()
+_LINE_IN_RMS_BUFFER = 180
+_LINE_IN_RMS_WINDOW = 15
+_LINE_IN_FAST_SAMPLES = 8
 
 
 class Ft8Window(QtWidgets.QMainWindow):
@@ -94,6 +80,7 @@ class Ft8Window(QtWidgets.QMainWindow):
   geo_signal = QtCore.pyqtSignal(int, str)  # decode_id, hely szöveg
   cycle_signal = QtCore.pyqtSignal()
   cycle_op_signal = QtCore.pyqtSignal(str)  # cycle → UI szál (vevő threadből)
+  line_in_signal = QtCore.pyqtSignal(bool, float)  # ok, rms
   _CYCLE_OP_DELAY_MS = 1200  # késő dekódok a slot elején (PyFT8 demap)
 
   _PRO_COL = 7
@@ -119,10 +106,9 @@ class Ft8Window(QtWidgets.QMainWindow):
     self._session = SessionLog()
     self._error_journal = ErrorJournal(ERROR_JOURNAL)
     bind_error_journal(self._error_journal)
-    self._rx_stall_last_decode = 0
-    self._rx_stall_since_mono = time.monotonic()
-    self._rx_stall_reported = False
+    self._rx_stall_guard = RxStallGuard(stall_sec=300.0)
     self._station = StationIdentity.load()
+    repair_tx_log()
     self._safety_snap = load_safety_state()
     tripped = self._safety_snap.tripped
     self._line_guard = LineOutGuard()
@@ -140,15 +126,22 @@ class Ft8Window(QtWidgets.QMainWindow):
     self._ptt.sync_time()
     self._tx_active = False
     self._last_tx_error = ""
-    self._last_gui_status_mono = 0.0
-    self._last_gui_status_phase = ""
-    self._last_gui_status_partner = ""
+    self._live_status = LiveStatusPublisher(GUI_LIVE_STATUS)
     self._hourly_refresh_mono = 0.0
     self._map_refresh_mono = 0.0
     self._highlight_refresh_mono = 0.0
     self._footer_refresh_mono = 0.0
-    self._operator_in_mtime = -1.0
+    self._operator_in = OperatorInReader(OPERATOR_IN)
     self._ptt_ok = True
+    self._line_in_monitor: LineInMonitor | None = None
+    self._linein_flash_on = False
+    self._line_in_rms_lock = threading.Lock()
+    self._line_in_rms_samples: deque[float] = deque(maxlen=_LINE_IN_RMS_BUFFER)
+    self._last_raw_rms = 0.0
+    self._line_in_state = LineInStateController(min_rms=LINE_IN_MIN_RMS)
+    self._line_in_tracker = LineInLevelTracker(fast_samples=_LINE_IN_FAST_SAMPLES)
+    self._esp_link = EspLinkController()
+    self._esp_flash_on = False
     self._shutting_down = False
     inner_ptt = getattr(self._ptt, "_inner", self._ptt)
     if isinstance(inner_ptt, Esp32Ptt):
@@ -167,6 +160,7 @@ class Ft8Window(QtWidgets.QMainWindow):
 
     self.decode_signal.connect(self._on_decode_ui)
     self.levels_signal.connect(self._on_levels_ui)
+    self.line_in_signal.connect(self._on_line_in_state_ui)
     self.geo_signal.connect(self._on_geo_ui, QtCore.Qt.QueuedConnection)
     self.cycle_signal.connect(self._refresh_hourly_table, QtCore.Qt.QueuedConnection)
     self.cycle_op_signal.connect(self._on_cycle_operator_delayed, QtCore.Qt.QueuedConnection)
@@ -337,7 +331,31 @@ class Ft8Window(QtWidgets.QMainWindow):
     self.btn_tx_indicator.setEnabled(False)
     self.btn_tx_indicator.setFixedHeight(30)
     self._style_tx_indicator(False)
+    self.btn_linein_alert = QtWidgets.QPushButton("⚠ Line-in: jelszint nem megfelelő")
+    self.btn_linein_alert.setVisible(False)
+    self.btn_linein_alert.setEnabled(False)
+    self.btn_linein_alert.setFixedHeight(30)
+    self.btn_linein_alert.setToolTip(
+      f"A bemeneti jel RMS < {LINE_IN_MIN_RMS:.1f} — ellenőrizd a kábelt és a rádió AF szintjét. TX tiltva."
+    )
+    self._style_linein_alert(False)
+    self.btn_esp_alert = QtWidgets.QPushButton("⚠ ESP32/PTT kapcsolat megszakadt")
+    self.btn_esp_alert.setVisible(False)
+    self.btn_esp_alert.setEnabled(False)
+    self.btn_esp_alert.setFixedHeight(30)
+    self.btn_esp_alert.setToolTip(
+      "Az ESP32 soros kapcsolat megszakadt. TX tiltva, automatikus újracsatlakozás fut."
+    )
+    self._style_esp_alert(False)
+    self._linein_flash_timer = QtCore.QTimer(self)
+    self._linein_flash_timer.setInterval(500)
+    self._linein_flash_timer.timeout.connect(self._flash_linein_alert)
+    self._esp_flash_timer = QtCore.QTimer(self)
+    self._esp_flash_timer.setInterval(500)
+    self._esp_flash_timer.timeout.connect(self._flash_esp_alert)
     status_row = QtWidgets.QHBoxLayout()
+    status_row.addWidget(self.btn_esp_alert)
+    status_row.addWidget(self.btn_linein_alert)
     status_row.addWidget(self.btn_tx_indicator)
     status_row.addWidget(self.lbl_status, stretch=1)
     layout.addLayout(status_row)
@@ -383,6 +401,7 @@ class Ft8Window(QtWidgets.QMainWindow):
     self.table.setAlternatingRowColors(True)
     self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
     self.table.setSortingEnabled(False)
+    self.table.cellDoubleClicked.connect(self._on_table_double_click)
     table_layout.addWidget(self.table)
 
     self.hour_wrap = QtWidgets.QWidget()
@@ -453,6 +472,7 @@ class Ft8Window(QtWidgets.QMainWindow):
     self.chk_power_safe.toggled.connect(self._on_power_safe_toggled)
 
     self._fill_sources()
+    self.combo_band.setCurrentText("20m")
     self._band_changed(self.combo_band.currentText())
     self._reload_worked_qso_highlights()
     self._toggle_map(self.chk_map.isChecked())
@@ -778,10 +798,9 @@ class Ft8Window(QtWidgets.QMainWindow):
 
   def _resume_esp_after_lock(self, reason: str, *, trip_on_fail: bool = True) -> bool:
     """ESP SAFETY_LOCK feloldás — reboot / ragadó PTT után."""
-    if not hasattr(self._ptt, "resume"):
-      return False
-    if not self._ptt.resume():
-      err = getattr(self._ptt, "last_error", "ESP32 RESUME sikertelen")
+    result = try_resume_esp(self._ptt, reason=reason)
+    if not result.ok:
+      err = result.error
       if trip_on_fail:
         mark_tripped(self._safety_snap, f"ESP LOCK ({reason}): {err}")
         save_safety_state(self._safety_snap)
@@ -791,8 +810,7 @@ class Ft8Window(QtWidgets.QMainWindow):
       self._write_gui_live_status(note=f"ESP_LOCK:{err}")
       self._log_gui_error("esp_resume_fail", f"{reason}: {err}")
       return False
-    self._ptt.sync_time()
-    self._ptt_ok = self._ptt.ping()
+    self._ptt_ok = result.ptt_ok
     self._last_tx_error = ""
     self._safety_snap.mcu_active = True
     save_safety_state(self._safety_snap)
@@ -814,14 +832,13 @@ class Ft8Window(QtWidgets.QMainWindow):
     if isinstance(inner, Esp32Ptt):
       lock_txt = "LOCK=1 (tiltva)" if inner.status().get("lock") else "LOCK=0 (szabad)"
     if self._resume_esp_after_lock("kézi menü", trip_on_fail=False):
-      reason = (self._safety_snap.reason or "").upper()
-      if self._safety_snap.tripped and ("ESP" in reason or "LOCK" in reason):
-        mark_reactivated(
-          self._safety_snap,
-          watchdog=self._act_watchdog.isChecked(),
-          line_guard=self._act_line_guard.isChecked(),
-          mcu=True,
-        )
+      plan = plan_esp_unlock_reactivate(
+        self._safety_snap,
+        watchdog=self._act_watchdog.isChecked(),
+        line_guard=self._act_line_guard.isChecked(),
+      )
+      if plan is not None:
+        apply_reactivate_plan(self._safety_snap, plan)
         save_safety_state(self._safety_snap)
         self.btn_ptt.setEnabled(True)
       self._update_safety_menu()
@@ -853,12 +870,12 @@ class Ft8Window(QtWidgets.QMainWindow):
     if self._act_line_guard.isChecked():
       self._line_guard.set_enabled(True)
       self._line_guard.acquire()
-    mark_reactivated(
+    plan = plan_reactivate_all(
       self._safety_snap,
       watchdog=self._act_watchdog.isChecked(),
       line_guard=self._act_line_guard.isChecked(),
-      mcu=True,
     )
+    apply_reactivate_plan(self._safety_snap, plan)
     save_safety_state(self._safety_snap)
     self.btn_ptt.setEnabled(True)
     self._last_tx_error = ""
@@ -909,135 +926,101 @@ class Ft8Window(QtWidgets.QMainWindow):
       self._line_guard.release()
     self._update_safety_menu()
 
+  def _apply_operator_command(self, op: OperatorCommand) -> None:
+    kind = op.kind
+    if kind == OperatorCmdKind.BAND:
+      idx = self.combo_band.findText(op.arg1)
+      if idx >= 0:
+        self.combo_band.setCurrentIndex(idx)
+        self._band_changed(op.arg1)
+    elif kind == OperatorCmdKind.DIAL:
+      self.spin_dial.setValue(float(op.arg1))
+    elif kind == OperatorCmdKind.PTT_ON and not self.btn_ptt.isChecked():
+      self.btn_ptt.setChecked(True)
+    elif kind == OperatorCmdKind.PTT_OFF and self.btn_ptt.isChecked():
+      self.btn_ptt.setChecked(False)
+    elif kind == OperatorCmdKind.PRO_ON and not self.chk_pro_tx.isChecked():
+      self.chk_pro_tx.setChecked(True)
+    elif kind == OperatorCmdKind.PRO_OFF and self.chk_pro_tx.isChecked():
+      self.chk_pro_tx.setChecked(False)
+    elif kind == OperatorCmdKind.CQ_MODE_ON and not self.chk_cq_uzem.isChecked():
+      self.chk_cq_uzem.setChecked(True)
+    elif kind == OperatorCmdKind.CQ_MODE_OFF and self.chk_cq_uzem.isChecked():
+      self.chk_cq_uzem.setChecked(False)
+    elif kind == OperatorCmdKind.PRO_PRIORITY:
+      self._station.pro.priority = parse_priority_mode(op.arg1)
+      self._sync_pro_priority_combo()
+      self._operator.set_pro_config(self._station.pro)
+    elif kind == OperatorCmdKind.MAP_OFF and self.chk_map.isChecked():
+      self.chk_map.setChecked(False)
+    elif kind == OperatorCmdKind.MAP_ON and not self.chk_map.isChecked():
+      self.chk_map.setChecked(True)
+    elif kind == OperatorCmdKind.CQ_WAIT:
+      try:
+        n = int(op.arg1)
+        self.slider_cq_wait.setValue(self._cq_wait_slider_index(n))
+      except ValueError:
+        pass
+    elif kind == OperatorCmdKind.PTT_PULSE:
+      self._run_ptt_pulse(float(op.arg1 or 2.0))
+    elif kind == OperatorCmdKind.START_RX:
+      if self.btn_start.isEnabled():
+        self._start()
+    elif kind == OperatorCmdKind.TX_TEST:
+      self._run_tx_test()
+    elif kind == OperatorCmdKind.ABORT_QSO:
+      self._operator.abort_qso("operátor")
+    elif kind == OperatorCmdKind.SAFETY_RESUME:
+      self._safety_reactivate_silent()
+    elif kind == OperatorCmdKind.SAFETY_UNLOCK:
+      self._resume_esp_after_lock("operator_in")
+    elif kind == OperatorCmdKind.ESP_SHUTDOWN:
+      self._safety_shutdown_mcu()
+      self._write_gui_live_status(note="ESP_SHUTDOWN", force=True)
+    elif kind == OperatorCmdKind.ERROR_INJECT_ALL:
+      self._inject_all_errors_test()
+    elif kind == OperatorCmdKind.ERROR_INJECT:
+      self._inject_error_test(op.arg1)
+    elif kind == OperatorCmdKind.CALL:
+      self._operator.engage_call(
+        op.arg1,
+        float(op.arg2),
+        rx_report=op.arg3,
+        rx_snr=int(op.arg4),
+        manual=True,
+      )
+    elif kind == OperatorCmdKind.INJECT_DECODE:
+      report = parse_inject_decode_command(op.arg1)
+      if report is not None:
+        self._on_decode_ui(report)
+
   def _poll_live_bridge(self) -> None:
     self._check_rx_stall()
-    try:
-      st = OPERATOR_IN.stat()
-      if st.st_size == 0:
-        self._operator_in_mtime = st.st_mtime
-        return
-      if st.st_mtime == self._operator_in_mtime:
-        return
-      self._operator_in_mtime = st.st_mtime
-      text = OPERATOR_IN.read_text(encoding="utf-8").strip()
-    except OSError:
-      return
+    self._check_esp_link()
+    text = self._operator_in.consume_if_changed()
     if not text:
       return
-    OPERATOR_IN.write_text("", encoding="utf-8")
-    self._operator_in_mtime = -1.0
-    for line in text.splitlines():
-      cmd = line.strip().upper()
-      if cmd.startswith("BAND "):
-        parts = cmd.split()
-        if len(parts) >= 2:
-          band = parts[1].lower()
-          if band.isdigit():
-            band = f"{band}m"
-          idx = self.combo_band.findText(band)
-          if idx >= 0:
-            self.combo_band.setCurrentIndex(idx)
-            self._band_changed(band)
-      elif cmd.startswith("DIAL "):
-        parts = cmd.split()
-        if len(parts) >= 2:
-          self.spin_dial.setValue(float(parts[1]))
-      elif cmd == "PTT_ON" and not self.btn_ptt.isChecked():
-        self.btn_ptt.setChecked(True)
-      elif cmd == "PTT_OFF" and self.btn_ptt.isChecked():
-        self.btn_ptt.setChecked(False)
-      elif cmd == "PRO_ON" and not self.chk_pro_tx.isChecked():
-        self.chk_pro_tx.setChecked(True)
-      elif cmd == "PRO_OFF" and self.chk_pro_tx.isChecked():
-        self.chk_pro_tx.setChecked(False)
-      elif cmd == "CQ_MODE_ON" and not self.chk_cq_uzem.isChecked():
-        self.chk_cq_uzem.setChecked(True)
-      elif cmd == "CQ_MODE_OFF" and self.chk_cq_uzem.isChecked():
-        self.chk_cq_uzem.setChecked(False)
-      elif cmd.startswith("PRO_PRIORITY "):
-        raw = cmd.split(maxsplit=1)[1].lower() if " " in cmd else ""
-        aliases = {
-          "balanced": PriorityMode.BALANCED,
-          "kiegyensúlyozott": PriorityMode.BALANCED,
-          "distance": PriorityMode.DISTANCE,
-          "távolság": PriorityMode.DISTANCE,
-          "weak_dx": PriorityMode.WEAK_DX,
-          "gyenge": PriorityMode.WEAK_DX,
-          "strong_fast": PriorityMode.STRONG_FAST,
-          "gyors": PriorityMode.STRONG_FAST,
-        }
-        mode = aliases.get(raw)
-        if mode is None:
-          try:
-            mode = PriorityMode(raw)
-          except ValueError:
-            mode = PriorityMode.BALANCED
-        self._station.pro.priority = mode
-        self._sync_pro_priority_combo()
-        self._operator.set_pro_config(self._station.pro)
-      elif cmd == "MAP_OFF" and self.chk_map.isChecked():
-        self.chk_map.setChecked(False)
-      elif cmd == "MAP_ON" and not self.chk_map.isChecked():
-        self.chk_map.setChecked(True)
-      elif cmd.startswith("CQ_WAIT "):
-        parts = cmd.split()
-        if len(parts) >= 2:
-          try:
-            n = int(parts[1])
-            idx = self._cq_wait_slider_index(n)
-            self.slider_cq_wait.setValue(idx)
-          except ValueError:
-            pass
-      elif cmd.startswith("PTT_PULSE"):
-        parts = cmd.split()
-        secs = float(parts[1]) if len(parts) > 1 else 2.0
-        self._run_ptt_pulse(secs)
-      elif cmd == "START_RX":
-        if self.btn_start.isEnabled():
-          self._start()
-      elif cmd == "TX_TEST":
-        self._run_tx_test()
-      elif cmd == "ABORT_QSO":
-        self._operator.abort_qso("operátor")
-      elif cmd in ("SAFETY_RESUME", "RESUME_ESP"):
-        self._safety_reactivate_silent()
-      elif cmd == "SAFETY_UNLOCK":
-        self._resume_esp_after_lock("operator_in")
-      elif cmd == "ESP_SHUTDOWN":
-        self._safety_shutdown_mcu()
-        self._write_gui_live_status(note="ESP_SHUTDOWN", force=True)
-      elif cmd == "ERROR_INJECT_ALL":
-        self._inject_all_errors_test()
-      elif cmd.startswith("ERROR_INJECT "):
-        self._inject_error_test(cmd[13:].strip())
-      elif cmd.startswith("CALL "):
-        parts = cmd.split()
-        if len(parts) >= 2:
-          call = parts[1]
-          hz = float(parts[2]) if len(parts) > 2 else 1867.0
-          report = parts[3] if len(parts) > 3 else ""
-          snr = int(parts[4]) if len(parts) > 4 else -15
-          self._operator.engage_call(call, hz, rx_report=report, rx_snr=snr)
+    for op in parse_operator_batch(text):
+      self._apply_operator_command(op)
     self._write_gui_live_status(note=f"cmd:{text}")
 
   def _check_rx_stall(self) -> None:
     if self._engine is None or self._shutting_down:
       return
-    now = time.monotonic()
-    if self._decode_count > self._rx_stall_last_decode:
-      self._rx_stall_last_decode = self._decode_count
-      self._rx_stall_since_mono = now
-      self._rx_stall_reported = False
-      return
-    stall_sec = 300.0
-    elapsed = now - self._rx_stall_since_mono
-    if elapsed >= stall_sec and not self._rx_stall_reported:
-      report_error("rx_decode_stall", f"{int(elapsed)} s új dekód nélkül")
-      self._rx_stall_reported = True
+    step = self._rx_stall_guard.observe(
+      decode_count=self._decode_count,
+      now_mono=time.monotonic(),
+      rx_running=True,
+    )
+    if step.should_report:
+      report_error("rx_decode_stall", f"{int(step.elapsed_sec)} s új dekód nélkül")
       self._update_error_log_menu()
 
   def _run_ptt_pulse(self, seconds: float) -> None:
     """Rövid PTT kulcsolás — GUI ESP-kapcsolat teszt (nem FT8 hang)."""
+    if self._line_in_monitor is not None and not self._line_in_monitor.signal_ok:
+      self.lbl_status.setText("PTT teszt tiltva — line-in jelszint nem megfelelő")
+      return
     def work() -> None:
       label = f"PTT teszt {seconds:.0f}s"
       self._on_tx_state(True, label)
@@ -1070,56 +1053,47 @@ class Ft8Window(QtWidgets.QMainWindow):
 
     threading.Thread(target=work, daemon=True, name="tx-test").start()
 
-  def _write_gui_live_status(self, *, last_message: str = "", note: str = "", force: bool = False) -> None:
-    phase = self._operator.phase.value
-    partner = self._operator._active.remote_call if self._operator._active else ""
-    now_mono = time.monotonic()
-    important = bool(note) or phase != self._last_gui_status_phase or partner != self._last_gui_status_partner
-    if (
-      not force
-      and not important
-      and now_mono - self._last_gui_status_mono < 0.25
-    ):
-      return
-
+  def _build_live_snapshot(self, *, last_message: str = "", note: str = "") -> GuiLiveSnapshot:
     inner_ptt = getattr(self._ptt, "_inner", self._ptt)
     esp_lock: bool | None = None
     if isinstance(inner_ptt, Esp32Ptt):
       esp_lock = bool(inner_ptt.status().get("lock"))
+    return GuiLiveSnapshot(
+      callsign=self._station.callsign,
+      operator=self._station.operator_name,
+      band=self.combo_band.currentText(),
+      dial_mhz=self.spin_dial.value(),
+      rx_running=self._engine is not None,
+      ptt_armed=self.btn_ptt.isChecked(),
+      pro_operator=self.chk_pro_tx.isChecked(),
+      cq_only_mode=self.chk_cq_uzem.isChecked(),
+      cq_wait_periods=CQ_WAIT_PERIOD_CHOICES[self.slider_cq_wait.value()],
+      map_visible=self.chk_map.isChecked(),
+      pro_priority=self._station.pro.priority.value,
+      qso_phase=self._operator.phase.value,
+      qso_partner=self._operator._active.remote_call if self._operator._active else "",
+      tx_active=self._tx_active,
+      last_tx_error=self._last_tx_error,
+      ptt_serial_ok=self._ptt_ok,
+      safety_tripped=self._safety_snap.tripped,
+      safety_reason=self._safety_snap.reason,
+      safety_watchdog=self._safety_snap.watchdog_on,
+      safety_line_guard=self._safety_snap.line_guard_on,
+      safety_mcu_active=self._safety_snap.mcu_active,
+      esp_lock=esp_lock,
+      decode_count=self._decode_count,
+      line_in_ok=self._line_in_monitor.signal_ok if self._line_in_monitor else True,
+      line_in_rms=round(self._line_in_monitor.last_rms, 4) if self._line_in_monitor else None,
+      line_in_tx_blocked=self._line_in_state.low,
+      last_message=last_message,
+      note=note,
+    )
 
-    st = {
-      "time_utc": time_iso_utc(time.time()),
-      "callsign": self._station.callsign,
-      "operator": self._station.operator_name,
-      "band": self.combo_band.currentText(),
-      "dial_mhz": self.spin_dial.value(),
-      "rx_running": self._engine is not None,
-      "ptt_armed": self.btn_ptt.isChecked(),
-      "pro_operator": self.chk_pro_tx.isChecked(),
-      "cq_only_mode": self.chk_cq_uzem.isChecked(),
-      "cq_wait_periods": CQ_WAIT_PERIOD_CHOICES[self.slider_cq_wait.value()],
-      "map_visible": self.chk_map.isChecked(),
-      "pro_priority": self._station.pro.priority.value,
-      "qso_phase": phase,
-      "qso_partner": partner,
-      "tx_active": self._tx_active,
-      "last_tx_error": self._last_tx_error,
-      "ptt_serial_ok": self._ptt_ok,
-      "safety_tripped": self._safety_snap.tripped,
-      "safety_reason": self._safety_snap.reason,
-      "safety_watchdog": self._safety_snap.watchdog_on,
-      "safety_line_guard": self._safety_snap.line_guard_on,
-      "safety_mcu_active": self._safety_snap.mcu_active,
-      "esp_lock": esp_lock,
-      "decode_count": self._decode_count,
-      "last_message": last_message,
-      "note": note,
-    }
-    FORGALMI_LIVE.mkdir(parents=True, exist_ok=True)
-    GUI_LIVE_STATUS.write_text(dumps_compact(st) + "\n", encoding="utf-8")
-    self._last_gui_status_mono = now_mono
-    self._last_gui_status_phase = phase
-    self._last_gui_status_partner = partner
+  def _write_gui_live_status(self, *, last_message: str = "", note: str = "", force: bool = False) -> None:
+    self._live_status.publish(
+      self._build_live_snapshot(last_message=last_message, note=note),
+      force=force,
+    )
 
   def _apply_pro_ui(self, *_args) -> None:
     on = self.chk_pro.isChecked()
@@ -1365,16 +1339,190 @@ class Ft8Window(QtWidgets.QMainWindow):
     dlg.exec_()
 
   def _style_tx_indicator(self, active: bool) -> None:
-    if active:
-      self.btn_tx_indicator.setStyleSheet(
-        "QPushButton { background-color: #b62324; color: #ffffff; font-weight: bold; "
-        "padding: 4px 14px; border-radius: 4px; border: 1px solid #f85149; }"
-      )
+    self.btn_tx_indicator.setStyleSheet(tx_indicator_stylesheet(active))
+
+  def _style_linein_alert(self, highlight: bool) -> None:
+    self.btn_linein_alert.setStyleSheet(linein_alert_stylesheet(highlight))
+
+  def _style_esp_alert(self, highlight: bool) -> None:
+    self.btn_esp_alert.setStyleSheet(esp_alert_stylesheet(highlight))
+
+  def _flash_linein_alert(self) -> None:
+    if not self._line_in_state.low:
+      return
+    self._linein_flash_on = not self._linein_flash_on
+    self._style_linein_alert(self._linein_flash_on)
+
+  def _flash_esp_alert(self) -> None:
+    if not self._esp_link.link_down:
+      return
+    self._esp_flash_on = not self._esp_flash_on
+    self._style_esp_alert(self._esp_flash_on)
+
+  def _set_linein_alert_visible(self, visible: bool) -> None:
+    if visible:
+      self.btn_linein_alert.setVisible(True)
+      self._linein_flash_on = True
+      self._style_linein_alert(True)
+      if not self._linein_flash_timer.isActive():
+        self._linein_flash_timer.start()
+      return
+    self._linein_flash_timer.stop()
+    self.btn_linein_alert.setVisible(False)
+
+  def _set_esp_alert_visible(self, visible: bool) -> None:
+    if visible:
+      self.btn_esp_alert.setVisible(True)
+      self._esp_flash_on = True
+      self._style_esp_alert(True)
+      if not self._esp_flash_timer.isActive():
+        self._esp_flash_timer.start()
+      return
+    self._esp_flash_timer.stop()
+    self.btn_esp_alert.setVisible(False)
+
+  def _check_esp_link(self) -> None:
+    inner_ptt = getattr(self._ptt, "_inner", self._ptt)
+    if not isinstance(inner_ptt, Esp32Ptt):
+      return
+
+    now = time.monotonic()
+    ok = self._ptt.ping()
+    self._ptt_ok = ok
+    events = self._esp_link.poll(
+      ping_ok=ok,
+      tx_active=self._tx_active,
+      now_mono=now,
+      last_error=getattr(self._ptt, "last_error", ""),
+    )
+
+    for event in events:
+      if event.kind == EspLinkEventKind.RESTORED:
+        self._set_esp_alert_visible(False)
+        self._last_tx_error = ""
+        self.lbl_status.setText("ESP32 kapcsolat helyreállt — TX folytatható")
+        for code in event.log_codes:
+          self._log_gui_error(code, event.detail, dedup=False)
+        self._write_gui_live_status(note=event.status_note, force=True)
+        return
+
+      if event.kind == EspLinkEventKind.DISCONNECTED:
+        self._set_esp_alert_visible(True)
+        self._last_tx_error = event.detail
+        self._operator.halt_transmission("esp_link_down", keep_armed=True)
+        self.lbl_status.setText(f"⚠ ESP32/PTT kapcsolat megszakadt — {event.detail}")
+        for code in event.log_codes:
+          self._log_gui_error(code, event.detail, dedup=False)
+        self._write_gui_live_status(note=event.status_note, force=True)
+
+      if event.kind == EspLinkEventKind.RECOVER_TRY:
+        for code in event.log_codes:
+          self._log_gui_error(code, event.detail, dedup=False)
+        if hasattr(self._ptt, "close"):
+          self._ptt.close()
+        if self._ptt.ping():
+          self._ptt.sync_time()
+          self._ptt_ok = True
+          recovered = self._esp_link.on_recover_success()
+          self._set_esp_alert_visible(False)
+          self._last_tx_error = ""
+          self.lbl_status.setText("ESP32 kapcsolat automatikusan helyreállt")
+          for code in recovered.log_codes:
+            self._log_gui_error(code, recovered.detail, dedup=False)
+          self._esp_link.mark_restored()
+          self._write_gui_live_status(note=recovered.status_note, force=True)
+
+  @QtCore.pyqtSlot(bool, float)
+  def _on_line_in_state_ui(self, ok: bool, rms: float) -> None:
+    with self._line_in_rms_lock:
+      self._line_in_rms_samples.clear()
+    event = self._line_in_state.on_signal_change(ok, rms)
+    if ok:
+      self._set_linein_alert_visible(False)
+      if event is not None and event.kind == LineInEventKind.RESTORED:
+        self._log_gui_error(event.log_code, event.detail, dedup=False)
+        self._resume_line_in_tx(rms)
     else:
-      self.btn_tx_indicator.setStyleSheet(
-        "QPushButton { background-color: #21262d; color: #8b949e; padding: 4px 14px; "
-        "border-radius: 4px; border: 1px solid #30363d; }"
-      )
+      self._set_linein_alert_visible(True)
+      if event is not None and event.kind == LineInEventKind.LOW:
+        self._log_gui_error(event.log_code, event.detail, dedup=False)
+        self._operator.halt_transmission("line_in_low", keep_armed=True)
+      if not self._tx_active:
+        self.lbl_status.setText(
+          f"⚠ Line-in jelszint nem megfelelő (RMS {rms:.3f}) — TX tiltva"
+        )
+    self._write_gui_live_status(force=True)
+
+  def _resume_line_in_tx(self, rms: float) -> None:
+    if self.btn_ptt.isChecked() and not self._safety_snap.tripped and not self._operator.armed:
+      self._operator.set_armed(True)
+    if self._tx_active:
+      return
+    hint = "TX folytatódik" if self._operator.armed else "Kapcsold be a PTT-t"
+    self.lbl_status.setText(f"Line-in rendben (RMS {rms:.3f}) — {hint}")
+
+  def _line_in_rms_for_check(self) -> float:
+    with self._line_in_rms_lock:
+      if self._line_in_rms_samples:
+        return max(list(self._line_in_rms_samples)[-_LINE_IN_RMS_WINDOW:])
+      return max(self._last_raw_rms, LINE_IN_MIN_RMS)
+
+  def _track_line_in_level(self, raw_rms: float) -> None:
+    mon = self._line_in_monitor
+    if mon is None:
+      return
+    step = self._line_in_tracker.observe(raw_rms, currently_low=self._line_in_state.low)
+    if step.should_evaluate:
+      mon.evaluate(raw_rms)
+
+  def _start_line_in_monitor(self, pulse: str) -> None:
+    self._stop_line_in_monitor()
+    with self._line_in_rms_lock:
+      self._line_in_rms_samples.clear()
+    mon = LineInMonitor(
+      pulse,
+      on_change=self.line_in_signal.emit,
+      rms_provider=self._line_in_rms_for_check,
+    )
+    self._line_in_monitor = mon
+    self._operator.tx._line_in_guard = mon.tx_allowed
+    mon.start()
+
+  def _stop_line_in_monitor(self) -> None:
+    self._set_linein_alert_visible(False)
+    self._line_in_state.reset()
+    self._line_in_tracker.reset()
+    if self._line_in_monitor is not None:
+      self._line_in_monitor.stop()
+      self._line_in_monitor = None
+    self._operator.tx._line_in_guard = None
+
+  def _on_table_double_click(self, row: int, _col: int) -> None:
+    """Dupla kattintás — kézi hívás (felülírja az outbound cooldown-t is)."""
+    msg_item = self.table.item(row, 5)
+    if msg_item is None:
+      return
+    hz_item = self.table.item(row, 4)
+    snr_item = self.table.item(row, 2)
+    result = parse_table_engage(
+      message=msg_item.text(),
+      my_callsign=self._station.callsign,
+      audio_hz_text=hz_item.text() if hz_item else "",
+      snr_text=snr_item.text() if snr_item else "0",
+    )
+    if not result.ok or result.request is None:
+      return
+    req = result.request
+    self._operator.engage_call(
+      req.call,
+      req.audio_hz,
+      rx_report=req.rx_report,
+      rx_snr=req.rx_snr,
+      manual=True,
+    )
+    self._refresh_qso_banner()
+    self._apply_table_qso_highlights()
+    self._write_gui_live_status(note=f"kézi:{req.call}")
 
   def _apply_table_qso_highlights(self) -> None:
     if not hasattr(self, "table"):
@@ -1429,6 +1577,7 @@ class Ft8Window(QtWidgets.QMainWindow):
     self._tx_active = active
     if error:
       self._last_tx_error = error
+      self._ptt_ok = False
       self._write_gui_live_status(note=f"TX HIBA: {error}", force=True)
       report_tx_error(message, error)
       self._update_error_log_menu()
@@ -1755,6 +1904,8 @@ class Ft8Window(QtWidgets.QMainWindow):
       on_cycle_search=lambda cycle, cst, n, busy, ts, snap: self._on_cycle_search(
         cycle, cst, n, busy, ts, snap
       ),
+      my_callsign=self._station.callsign,
+      my_grid4=self._station.grid4,
     )
     self._gain_changed()
     home = self._home_for_geo()
@@ -1779,9 +1930,7 @@ class Ft8Window(QtWidgets.QMainWindow):
       self.btn_stop.setEnabled(False)
       self.lbl_status.setText(f"⚠ RX indítás sikertelen: {exc}")
       return
-    self._rx_stall_last_decode = self._decode_count
-    self._rx_stall_since_mono = time.monotonic()
-    self._rx_stall_reported = False
+    self._rx_stall_guard.reset(decode_count=self._decode_count, now_mono=time.monotonic())
     self._operator.set_band(self.combo_band.currentText(), self.spin_dial.value())
     self.btn_start.setEnabled(False)
     self.btn_stop.setEnabled(True)
@@ -1792,8 +1941,10 @@ class Ft8Window(QtWidgets.QMainWindow):
     self.lbl_status.setText(
       f"Vétel: {pulse} @ {self.spin_dial.value():.3f} MHz USB — várakozás FT8 ciklusokra (15 s)…"
     )
+    self._start_line_in_monitor(pulse)
 
   def _stop(self, *, halt_reason: str = "stop") -> None:
+    self._stop_line_in_monitor()
     self._prop_timer.stop()
     self._operator.halt_transmission(halt_reason)
     if self._tx_active:
@@ -1966,6 +2117,10 @@ class Ft8Window(QtWidgets.QMainWindow):
   def _on_levels_ui(
     self, raw_rms: float, out_rms: float, peak: float, clip: float, gain: float
   ) -> None:
+    with self._line_in_rms_lock:
+      self._last_raw_rms = raw_rms
+      self._line_in_rms_samples.append(raw_rms)
+    self._track_line_in_level(raw_rms)
     self.meter_raw.set_values(raw_rms, peak, 0.0)
     self.meter_out.set_values(out_rms, peak, clip)
     if self._last_cycle_for_audio:
@@ -1983,6 +2138,8 @@ class Ft8Window(QtWidgets.QMainWindow):
     self._live_timer.stop()
     self._prop_timer.stop()
     self._qso_banner_timer.stop()
+    self._linein_flash_timer.stop()
+    self._esp_flash_timer.stop()
     self._operator.tx.on_state = None
     self._stop(halt_reason="close")
     self._operator.shutdown(spin=self._spin_shutdown_events)

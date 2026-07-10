@@ -1,0 +1,199 @@
+================================================================================
+  ft8-autopilot — FT8 automata üzem (offline vezérlők)
+================================================================================
+
+Minden parancsot a projekt mappából futtass:
+
+  cd ft8-autopilot
+
+
+--------------------------------------------------------------------------------
+1) GYORS VEZÉRLÉS (ajánlott)
+--------------------------------------------------------------------------------
+
+Indítás (GUI + élő bridge + felügyelet + RX + PRO + PTT):
+
+  ./start
+
+Leállítás:
+
+  ./start stop
+
+Újraindítás:
+
+  ./start restart
+
+Állapot (fut-e, PTT, ESP, line-in, dekódok):
+
+  ./start status
+
+Súgó:
+
+  ./start help
+
+
+--------------------------------------------------------------------------------
+2) MANUÁLIS INDÍTÁS / LEÁLLÍTÁS (ha a start fájl nem elég)
+--------------------------------------------------------------------------------
+
+Indítás (ugyanaz, amit a ./start csinál):
+
+  bash scripts/start_auto_ft8.sh
+
+Leállítás (három fő folyamat):
+
+  pkill -f run_ft8_gui.py
+  pkill -f ft8_live_bridge.py
+  pkill -f auto_ft8_watch.py
+
+Ellenőrzés — fut-e valami:
+
+  pgrep -af run_ft8_gui.py
+  pgrep -af ft8_live_bridge.py
+  pgrep -af auto_ft8_watch.py
+
+Ha nem listáz semmit, le van állítva.
+
+
+--------------------------------------------------------------------------------
+3) ÉLŐ ÁLLAPOT OLVASÁSA (internet nélkül)
+--------------------------------------------------------------------------------
+
+Rövid JSON állapot:
+
+  cat forgalminaplo/live/gui_status.json
+
+Szép összefoglaló:
+
+  ./start status
+
+Fontos mezők a gui_status.json-ban:
+  - rx_running      : vétel megy-e
+  - ptt_armed       : PTT be van-e kapcsolva (adás engedélyezve)
+  - pro_operator    : PRO operátor be van-e kapcsolva
+  - ptt_serial_ok   : ESP32 / soros PTT válaszol-e
+  - safety_mcu_active : biztonsági MCU aktív-e
+  - line_in_ok      : line-in jelszint rendben van-e
+  - hardware_health : összesített hardver állapot (issues, tx_ready)
+
+
+--------------------------------------------------------------------------------
+4) PARANCSKÜLDÉS A FUTÓ GUI-NAK (operator_in.txt)
+--------------------------------------------------------------------------------
+
+A GUI kb. másodpercenként olvassa a fájlt, majd üríti.
+Egy parancs küldése:
+
+  echo "PTT_OFF" > forgalminaplo/live/operator_in.txt
+
+Több parancs egyszerre:
+
+  printf 'START_RX\nPRO_ON\nPTT_ON\n' > forgalminaplo/live/operator_in.txt
+
+Gyakori parancsok:
+
+  PTT_ON              — adás engedélyezése (PTT arm)
+  PTT_OFF             — adás tiltása
+  PRO_ON              — PRO operátor be
+  PRO_OFF             — PRO operátor ki
+  CQ_MODE_ON          — csak saját CQ üzem
+  CQ_MODE_OFF         — normál üzem
+  START_RX            — vétel indítása (ha leállt)
+  ABORT_QSO           — aktív QSO megszakítása
+  BAND 40m            — sáv váltás (40m, 20m, 30m, 80m)
+  DIAL 7.074          — dial MHz (pl. 40m: 7.074)
+  MAP_ON / MAP_OFF    — térkép ki/be
+  SAFETY_RESUME       — biztonsági rendszer újraaktiválás
+  RESUME_ESP          — ESP32 feloldás (RESUME)
+  ESP_SHUTDOWN        — ESP32 szándékos leállítás
+
+Példa — csak hallgatás, adás nélkül:
+
+  printf 'PTT_OFF\n' > forgalminaplo/live/operator_in.txt
+
+Példa — teljes automata visszaállítás:
+
+  printf 'START_RX\nPRO_ON\nCQ_MODE_OFF\nPTT_ON\n' > forgalminaplo/live/operator_in.txt
+
+
+--------------------------------------------------------------------------------
+5) NAPLÓK (ha valami nem stimmel)
+--------------------------------------------------------------------------------
+
+GUI napló:
+
+  tail -f forgalminaplo/live/gui_nohup.log
+
+Bridge napló:
+
+  tail -f forgalminaplo/live/bridge_nohup.log
+
+Auto felügyelet napló:
+
+  tail -f forgalminaplo/live/auto_watch.log
+
+TX események:
+
+  tail -f forgalminaplo/live/tx.log
+
+Hibanapló (GUI):
+
+  cat forgalminaplo/live/error_journal.json
+
+Kilépés a tail -f nézetből: Ctrl+C
+
+
+--------------------------------------------------------------------------------
+6) ESP32 / USB PROBLÉMA
+--------------------------------------------------------------------------------
+
+Ha kihúzod és visszadugod az ESP-t, a program automatikusan próbál
+helyreállni. Nézd az állapotot:
+
+  ./start status
+
+Ha nem áll vissza, újraindítás:
+
+  ./start restart
+
+Kézi ESP feloldás (ha SAFETY_LOCK):
+
+  echo "RESUME_ESP" > forgalminaplo/live/operator_in.txt
+
+
+--------------------------------------------------------------------------------
+7) BIZTONSÁGI MENTÉS HELYE
+--------------------------------------------------------------------------------
+
+  forgalminaplo/backup/
+
+Legutóbbi teljes mentés (személyes adatok nélkül):
+  forgalminaplo/backup/ft8-autopilot_BACKUP_szemelyes-adat-nelkul_20260708_214045.tar.gz
+
+
+--------------------------------------------------------------------------------
+8) GYORS HIBAKERESÉS
+--------------------------------------------------------------------------------
+
+Semmi nem fut?
+
+  ./start
+
+Fut, de nincs dekód?
+
+  ./start status
+  (line_in_ok legyen true, rx_running legyen true)
+
+PTT nem megy?
+
+  ./start status
+  (ptt_serial_ok, safety_mcu_active, hardware_health.issues)
+
+Teljes újraindítás „tiszta lappal”:
+
+  ./start restart
+
+
+================================================================================
+  Készítve: ft8-autopilot stabil automata üzemhez
+================================================================================

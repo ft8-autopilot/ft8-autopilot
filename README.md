@@ -56,7 +56,8 @@ PYTHONPATH=. .venv/bin/python scripts/run_ft8_gui.py
 ### 4. Full auto mode (GUI + bridge + watch)
 
 ```bash
-./scripts/start_auto_ft8.sh
+./start
+# or: ./scripts/start_auto_ft8.sh
 ```
 
 Writes live status to `forgalminaplo/live/gui_status.json`. Operator commands: `forgalminaplo/live/operator_in.txt` (`PTT_ON`, `PRO_ON`, `ABORT_QSO`, …).
@@ -80,6 +81,7 @@ ft8-autopilot/
 ├── forgalminaplo/        # Your QSO data (not in git) — see station.json.example
 ├── opt-lab/              # Benchmarks, native slot timer source
 ├── requirements.txt
+├── start                 # Launcher: start | stop | status | restart
 ├── README.md             # This file (English)
 └── README.hu.md          # Hungarian documentation
 ```

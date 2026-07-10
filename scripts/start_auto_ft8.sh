@@ -18,7 +18,8 @@ sleep 5
 pgrep -f ft8_live_bridge.py >/dev/null || \
   nohup "$ROOT/.venv/bin/python" "$ROOT/scripts/ft8_live_bridge.py" >> "$LIVE/bridge_nohup.log" 2>&1 &
 
-printf 'START_RX\nPRO_ON\nCQ_MODE_ON\nPTT_ON\nABORT_QSO\n' > "$LIVE/operator_in.txt"
+sleep 2
+printf 'BAND 20m\nDIAL 14.074\nSTART_RX\nPRO_ON\nCQ_MODE_OFF\nPTT_ON\nABORT_QSO\n' > "$LIVE/operator_in.txt"
 
 nohup "$ROOT/.venv/bin/python" "$ROOT/scripts/auto_ft8_watch.py" >> "$LIVE/auto_watch_nohup.log" 2>&1 &
 

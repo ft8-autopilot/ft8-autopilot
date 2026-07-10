@@ -55,7 +55,7 @@ class SafeFigureCanvas(FigureCanvas):
 
   def resizeEvent(self, event) -> None:
     sz = event.size()
-    if sz.width() < 8 or sz.height() < 8:
+    if sz.width() < 24 or sz.height() < 24:
       return
     try:
       super().resizeEvent(event)

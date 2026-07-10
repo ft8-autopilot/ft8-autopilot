@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hot path benchmark — cw-discover-opt."""
+"""Hot path benchmark — ft8-autopilot."""
 from __future__ import annotations
 
 import json
